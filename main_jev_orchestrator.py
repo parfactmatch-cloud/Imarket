@@ -1,8 +1,11 @@
 """
 main_jev_orchestrator.py
 Production Entry Point linking Ingestion, Greeks, Multi-Timeframe, and Execution.
+Updated to dynamically read GitHub Secrets & Environment Variables.
 """
 
+import os
+import sys
 import time
 import threading
 from fyers_auth_automation import FyersAuthManager
@@ -17,26 +20,52 @@ def start_system():
     print(">>> Jev Engine (Indian Equity Derivatives Edition) Starting...")
     print("=" * 60)
 
-    # 1. Initialize State Store
+    # 1. Fetch Credentials securely from Environment Variables / GitHub Secrets
+    fyers_client_id = os.environ.get("FYERS_APP_ID", "")
+    fyers_secret_key = os.environ.get("FYERS_SECRET_KEY", "")
+    fyers_id = os.environ.get("FYERS_ID", "")
+    fyers_pin = os.environ.get("FYERS_PIN", "")
+    fyers_totp_key = os.environ.get("FYERS_TOTP_KEY", "")
+
+    telegram_bot_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    telegram_chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
+
+    # Optional: Execution Mode toggle via environment (Default: True for Paper Mode)
+    paper_mode_env = os.environ.get("PAPER_MODE", "True").lower() in ("true", "1", "yes")
+
+    # 2. Basic Configuration Validation
+    if not telegram_bot_token or not telegram_chat_id:
+        print("[WARNING] Telegram credentials not fully set in environment. Alerts might not be delivered.")
+
+    # 3. Initialize State Store
     state_store = EngineStateStore("engine_state.db")
 
-    # 2. Authentication
+    # 4. Headless Daily Authentication Setup
     auth_mgr = FyersAuthManager(
-        client_id="YOUR_FYERS_APP_ID",
-        secret_key="YOUR_FYERS_SECRET_KEY",
+        client_id=fyers_client_id,
+        secret_key=fyers_secret_key,
         redirect_uri="https://trade.fyers.in/api-login/redirect-uri/index.html",
-        fyers_id="YOUR_FYERS_ID",
-        pin="YOUR_PIN",
-        totp_key="YOUR_TOTP_KEY"
+        fyers_id=fyers_id,
+        pin=fyers_pin,
+        totp_key=fyers_totp_key
     )
 
-    # 3. Router (Default: Paper Mode True)
-    router = ExecutionRouter(fyers_client=None, state_store=state_store, paper_mode=True)
+    # Note: When paper testing without live Fyers API connection, fallback safely
+    fyers_client = None
+    if not paper_mode_env and fyers_client_id and fyers_totp_key:
+        try:
+            token = auth_mgr.get_valid_token()
+            print("[Auth] Fyers token acquired successfully.")
+        except Exception as e:
+            print(f"[Auth Error] Failed to generate Fyers token: {e}")
 
-    # 4. Telegram Controller
+    # 5. Execution Router
+    router = ExecutionRouter(fyers_client=fyers_client, state_store=state_store, paper_mode=paper_mode_env)
+
+    # 6. Telegram Controller Setup
     tg = TelegramController(
-        bot_token="YOUR_TELEGRAM_BOT_TOKEN",
-        chat_id="YOUR_TELEGRAM_CHAT_ID",
+        bot_token=telegram_bot_token,
+        chat_id=telegram_chat_id,
         state_store=state_store,
         router=router
     )
@@ -45,20 +74,25 @@ def start_system():
         tg_thread = threading.Thread(target=tg.run_polling, daemon=True)
         tg_thread.start()
 
-    tg.send_alert("System Online", "Jev Engine v3.0 (Indian Derivatives) Started in Paper Mode.")
+    mode_label = "Paper Mode" if paper_mode_env else "Live Real Funds"
+    tg.send_alert("System Online", f"Jev Engine v3.0 (Indian Derivatives) Started in {mode_label}.")
 
-    # 5. Core Run-Loop with Mock Telemetry Baseline
+    # 7. Core Run-Loop with Telemetry Baseline
     engine = LagNeutralizedEngine(pdh=23250.0, pdl=23050.0, pdc=23140.0)
 
-    print("[Ready] Engine initialized. Monitoring Indian Derivatives...")
+    print(f"[Ready] Engine initialized ({mode_label}). Monitoring Indian Derivatives...")
     try:
+        # For scheduled GitHub Actions, run a fixed batch of cycles
+        # In a dedicated 24/7 server/VPS, change to: while True
         iteration = 0
-        while iteration < 5:  # Demo loop count, run indefinitely in production
+        max_iterations = int(os.environ.get("MAX_ITERATIONS", "10"))
+
+        while iteration < max_iterations:
             if state_store.get_system_flag("SYSTEM_PAUSED", "0") == "1":
                 time.sleep(2)
                 continue
 
-            # In production, replace with real WebSocket tick feed
+            # In production, replace with real WebSocket live tick feed
             mock_bar = FastBar("14:24", 23210, 23265, 23205, 23262, 45000, 270)
             decision = engine.evaluate_lag_free_execution(mock_bar, [], dealer_net_dex=125000, cvd_delta=4500)
 
