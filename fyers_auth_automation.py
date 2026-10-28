@@ -1,7 +1,7 @@
 """
 fyers_auth_automation.py
 Production Headless Daily Token Generation using TOTP and SHA-256 AppIdHash.
-Zero Manual Intervention with Detailed Logging and Fallback Safety.
+Supports both -100 (Standard) and -200 (Custom/Vendor) Fyers App ID Types.
 """
 
 import json
@@ -36,14 +36,26 @@ class FyersAuthManager:
         current_totp = totp.now()
         session = requests.Session()
         session.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "application/json",
+            "Content-Type": "application/json"
         })
 
         # Step 1: Request auth code
+        # For -200 apps, try type "2" first, then fallback to "1" or app prefix if rejected
+        app_type = "2"
         res1 = session.post(
             "https://api-t1.fyers.in/api/v3/generate-authcode",
-            json={"fy_id": self.fyers_id, "app_id": "2"}
+            json={"fy_id": self.fyers_id, "app_id": app_type}
         )
+        
+        if res1.status_code != 200 or not res1.text.strip():
+            # Fallback attempt with app_type = "1"
+            res1 = session.post(
+                "https://api-t1.fyers.in/api/v3/generate-authcode",
+                json={"fy_id": self.fyers_id, "app_id": "1"}
+            )
+
         if res1.status_code != 200 or not res1.text.strip():
             raise RuntimeError(f"Step 1 Failed: Status {res1.status_code}, Body: {res1.text[:200]}")
 
