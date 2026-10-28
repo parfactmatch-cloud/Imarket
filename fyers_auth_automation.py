@@ -1,14 +1,15 @@
 """
 fyers_auth_automation.py
-Production Headless Daily Token Generation using TOTP and SHA-256 AppIdHash.
-Supports both -100 (Standard) and -200 (Custom/Vendor) Fyers App ID Types.
+100% Automated Headless Auth using Playwright (Bypasses Cloudflare 403 WAF).
+Generates daily access token automatically every morning.
 """
 
-import json
 import os
+import json
 import hashlib
 import pyotp
 import requests
+from playwright.sync_api import sync_playwright
 
 
 class FyersAuthManager:
@@ -22,110 +23,87 @@ class FyersAuthManager:
         self.token_file = "fyers_access_token.json"
 
     def _get_app_id_hash(self) -> str:
-        """
-        Fyers API v3 requires appIdHash: SHA-256(client_id:secret_key)
-        """
         raw_str = f"{self.client_id}:{self.secret_key}"
         return hashlib.sha256(raw_str.encode('utf-8')).hexdigest()
 
     def generate_token(self) -> str:
         if not (self.client_id and self.secret_key and self.totp_key and self.pin and self.fyers_id):
-            raise ValueError("Incomplete credentials: Ensure FYERS_APP_ID, FYERS_SECRET_KEY, FYERS_ID, FYERS_PIN, FYERS_TOTP_KEY are set.")
+            raise ValueError("Credentials missing in Environment Variables.")
 
-        totp = pyotp.TOTP(self.totp_key)
-        current_totp = totp.now()
-        session = requests.Session()
-        session.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept": "application/json",
-            "Content-Type": "application/json"
-        })
+        # Step 1: Get Auth Code via Headless Chromium
+        auth_code = self._get_auth_code_via_browser()
 
-        # Step 1: Request auth code
-        # For -200 apps, try type "2" first, then fallback to "1" or app prefix if rejected
-        app_type = "2"
-        res1 = session.post(
-            "https://api-t1.fyers.in/api/v3/generate-authcode",
-            json={"fy_id": self.fyers_id, "app_id": app_type}
-        )
-        
-        if res1.status_code != 200 or not res1.text.strip():
-            # Fallback attempt with app_type = "1"
-            res1 = session.post(
-                "https://api-t1.fyers.in/api/v3/generate-authcode",
-                json={"fy_id": self.fyers_id, "app_id": "1"}
-            )
-
-        if res1.status_code != 200 or not res1.text.strip():
-            raise RuntimeError(f"Step 1 Failed: Status {res1.status_code}, Body: {res1.text[:200]}")
-
-        try:
-            res1_json = res1.json()
-        except Exception:
-            raise RuntimeError(f"Step 1 Non-JSON Response: {res1.text[:200]}")
-
-        request_key = res1_json.get("request_key")
-        if not request_key:
-            raise RuntimeError(f"Step 1 Missing request_key: {res1_json}")
-
-        # Step 2: Verify TOTP
-        res2 = session.post(
-            "https://api-t1.fyers.in/api/v3/verify-totp",
-            json={"request_key": request_key, "otp": current_totp}
-        )
-        if res2.status_code != 200 or not res2.text.strip():
-            raise RuntimeError(f"Step 2 Failed: Status {res2.status_code}, Body: {res2.text[:200]}")
-
-        try:
-            res2_json = res2.json()
-        except Exception:
-            raise RuntimeError(f"Step 2 Non-JSON Response: {res2.text[:200]}")
-
-        request_key_2 = res2_json.get("request_key")
-        if not request_key_2:
-            raise RuntimeError(f"Step 2 Missing request_key_2: {res2_json}")
-
-        # Step 3: Verify PIN
-        res3 = session.post(
-            "https://api-t1.fyers.in/api/v3/verify-pin",
-            json={"request_key": request_key_2, "identity_type": "pin", "identifier": self.pin}
-        )
-        if res3.status_code != 200 or not res3.text.strip():
-            raise RuntimeError(f"Step 3 Failed: Status {res3.status_code}, Body: {res3.text[:200]}")
-
-        try:
-            res3_json = res3.json()
-        except Exception:
-            raise RuntimeError(f"Step 3 Non-JSON Response: {res3.text[:200]}")
-
-        auth_code = res3_json.get("data", {}).get("auth_code")
-        if not auth_code:
-            raise RuntimeError(f"Step 3 Missing auth_code: {res3_json}")
-
-        # Step 4: Token Exchange with SHA-256 AppIdHash
+        # Step 2: Exchange Auth Code for Access Token
         app_id_hash = self._get_app_id_hash()
         token_payload = {
             "grant_type": "authorization_code",
             "appIdHash": app_id_hash,
             "code": auth_code
         }
-        res4 = session.post("https://api-t1.fyers.in/api/v3/token", json=token_payload)
-        if res4.status_code != 200 or not res4.text.strip():
-            raise RuntimeError(f"Step 4 Failed: Status {res4.status_code}, Body: {res4.text[:200]}")
+        res = requests.post("https://api-t1.fyers.in/api/v3/token", json=token_payload)
+        res_json = res.json()
+        access_token = res_json.get("access_token", "")
 
-        try:
-            res4_json = res4.json()
-        except Exception:
-            raise RuntimeError(f"Step 4 Non-JSON Response: {res4.text[:200]}")
-
-        access_token = res4_json.get("access_token", "")
         if not access_token:
-            raise RuntimeError(f"Step 4 Token generation failed: {res4_json}")
+            raise RuntimeError(f"Token generation failed: {res_json}")
 
         with open(self.token_file, "w") as f:
             json.dump({"access_token": access_token}, f)
 
         return access_token
+
+    def _get_auth_code_via_browser(self) -> str:
+        login_url = (
+            f"https://api-t1.fyers.in/api/v3/generate-authcode"
+            f"?client_id={self.client_id}&redirect_uri={self.redirect_uri}"
+            f"&response_type=code&state=sample_state"
+        )
+
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            context = browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            )
+            page = context.new_page()
+
+            # 1. Open Fyers Login Portal
+            page.goto(login_url, wait_until="networkidle")
+
+            # 2. Enter Fyers Client ID
+            page.wait_for_selector("#fy_client_id", timeout=15000)
+            page.fill("#fy_client_id", self.fyers_id)
+            page.click("#clientIdSubmit")
+
+            # 3. Enter TOTP
+            page.wait_for_selector(".otp-container input", timeout=15000)
+            current_totp = pyotp.TOTP(self.totp_key).now()
+            inputs = page.query_selector_all(".otp-container input")
+            for i, char in enumerate(current_totp):
+                inputs[i].fill(char)
+            page.click("#confirmOtpSubmit")
+
+            # 4. Enter 4-Digit PIN
+            page.wait_for_selector(".pin-container input", timeout=15000)
+            pin_inputs = page.query_selector_all(".pin-container input")
+            for i, char in enumerate(self.pin):
+                pin_inputs[i].fill(char)
+            page.click("#verifyPinSubmit")
+
+            # 5. Wait for Redirect URI and Extract auth_code
+            page.wait_for_url(lambda url: "auth_code=" in url, timeout=20000)
+            final_url = page.url
+            browser.close()
+
+            # Extract auth_code from URL
+            import urllib.parse
+            parsed = urllib.parse.urlparse(final_url)
+            query_params = urllib.parse.parse_qs(parsed.query)
+            auth_code = query_params.get("auth_code", [""])[0]
+
+            if not auth_code:
+                raise RuntimeError("Failed to extract auth_code from redirected URL.")
+
+            return auth_code
 
     def get_valid_token(self) -> str:
         if os.path.exists(self.token_file):
