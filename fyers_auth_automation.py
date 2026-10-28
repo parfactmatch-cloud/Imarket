@@ -1,12 +1,13 @@
 """
 fyers_auth_automation.py
 100% Automated Headless Auth using Playwright (Bypasses Cloudflare 403 WAF).
-Generates daily access token automatically every morning.
+Generates daily access token automatically without manual intervention.
 """
 
 import os
 import json
 import hashlib
+import urllib.parse
 import pyotp
 import requests
 from playwright.sync_api import sync_playwright
@@ -28,12 +29,12 @@ class FyersAuthManager:
 
     def generate_token(self) -> str:
         if not (self.client_id and self.secret_key and self.totp_key and self.pin and self.fyers_id):
-            raise ValueError("Credentials missing in Environment Variables.")
+            raise ValueError("Credentials missing in Environment Variables. Check GitHub Secrets.")
 
-        # Step 1: Get Auth Code via Headless Chromium
+        # Step 1: Headless Playwright se Auth Code hasil karna
         auth_code = self._get_auth_code_via_browser()
 
-        # Step 2: Exchange Auth Code for Access Token
+        # Step 2: Auth Code ko Access Token ke liye exchange karna
         app_id_hash = self._get_app_id_hash()
         token_payload = {
             "grant_type": "authorization_code",
@@ -66,36 +67,34 @@ class FyersAuthManager:
             )
             page = context.new_page()
 
-            # 1. Open Fyers Login Portal
-            page.goto(login_url, wait_until="networkidle")
+            # Fix: 'domcontentloaded' used to prevent 30s networkidle timeout
+            page.goto(login_url, wait_until="domcontentloaded", timeout=60000)
 
-            # 2. Enter Fyers Client ID
-            page.wait_for_selector("#fy_client_id", timeout=15000)
+            # 1. Enter Client ID
+            page.wait_for_selector("#fy_client_id", timeout=30000)
             page.fill("#fy_client_id", self.fyers_id)
             page.click("#clientIdSubmit")
 
-            # 3. Enter TOTP
-            page.wait_for_selector(".otp-container input", timeout=15000)
+            # 2. Enter TOTP
+            page.wait_for_selector(".otp-container input", timeout=30000)
             current_totp = pyotp.TOTP(self.totp_key).now()
             inputs = page.query_selector_all(".otp-container input")
             for i, char in enumerate(current_totp):
                 inputs[i].fill(char)
             page.click("#confirmOtpSubmit")
 
-            # 4. Enter 4-Digit PIN
-            page.wait_for_selector(".pin-container input", timeout=15000)
+            # 3. Enter PIN
+            page.wait_for_selector(".pin-container input", timeout=30000)
             pin_inputs = page.query_selector_all(".pin-container input")
             for i, char in enumerate(self.pin):
                 pin_inputs[i].fill(char)
             page.click("#verifyPinSubmit")
 
-            # 5. Wait for Redirect URI and Extract auth_code
-            page.wait_for_url(lambda url: "auth_code=" in url, timeout=20000)
+            # 4. Wait for redirect and parse auth_code
+            page.wait_for_url(lambda url: "auth_code=" in url, timeout=30000)
             final_url = page.url
             browser.close()
 
-            # Extract auth_code from URL
-            import urllib.parse
             parsed = urllib.parse.urlparse(final_url)
             query_params = urllib.parse.parse_qs(parsed.query)
             auth_code = query_params.get("auth_code", [""])[0]
