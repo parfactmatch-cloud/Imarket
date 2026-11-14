@@ -2,13 +2,14 @@ name: Jev Engine Automated Signals
 
 on:
   schedule:
-    # 9:15 AM IST to 3:30 PM IST (Monday to Friday)
-    - cron: '*/5 3-9 * * 1-5'
+    # 03:45 UTC = 09:15 AM IST (Monday to Friday)
+    - cron: '45 3 * * 1-5'
   workflow_dispatch:
 
 jobs:
   run-engine:
     runs-on: ubuntu-latest
+    timeout-minutes: 360
 
     steps:
       - name: Checkout Code
@@ -26,7 +27,7 @@ jobs:
           pip install -r requirements.txt
           playwright install chromium --with-deps
 
-      - name: Run Jev Engine Iteration
+      - name: Run Jev Engine Live Session
         env:
           FYERS_APP_ID: ${{ secrets.FYERS_APP_ID }}
           FYERS_SECRET_KEY: ${{ secrets.FYERS_SECRET_KEY }}
@@ -35,5 +36,6 @@ jobs:
           FYERS_TOTP_KEY: ${{ secrets.FYERS_TOTP_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          PAPER_MODE: "True"
         run: |
           python main_jev_orchestrator.py
