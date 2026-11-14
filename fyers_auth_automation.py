@@ -1,10 +1,11 @@
 """
 fyers_auth_automation.py
 100% Automated Headless Auth using Playwright.
-Handles Fyers' new Login UI: Client ID Tab -> Sequential Typing -> Universal TOTP/PIN Detection -> Instant URL Commit Capture.
+Handles Fyers' new Login UI: Official Slash Redirect URI -> Client ID Tab -> Fresh TOTP -> Auto-Submit PIN Capture.
 """
 
 import os
+import time
 import json
 import hashlib
 import urllib.parse
@@ -17,7 +18,9 @@ class FyersAuthManager:
     def __init__(self, client_id: str, secret_key: str, redirect_uri: str, fyers_id: str, pin: str, totp_key: str):
         self.client_id = client_id.strip() if client_id else ""
         self.secret_key = secret_key.strip() if secret_key else ""
-        self.redirect_uri = redirect_uri.strip() if redirect_uri else ""
+        env_redirect = os.environ.get("FYERS_REDIRECT_URI", "").strip()
+        default_redirect = "https://trade.fyers.in/api-login/redirect-uri/index.html"
+        self.redirect_uri = env_redirect if env_redirect else (redirect_uri.strip() if redirect_uri else default_redirect)
         self.fyers_id = fyers_id.strip().upper() if fyers_id else ""
         self.pin = pin.strip() if pin else ""
         self.totp_key = totp_key.strip().replace(" ", "") if totp_key else ""
@@ -26,6 +29,12 @@ class FyersAuthManager:
     def _get_app_id_hash(self) -> str:
         raw_str = f"{self.client_id}:{self.secret_key}"
         return hashlib.sha256(raw_str.encode('utf-8')).hexdigest()
+
+    def _get_fresh_totp(self) -> str:
+        remaining = 30 - (int(time.time()) % 30)
+        if remaining < 5:
+            time.sleep(remaining + 1)
+        return pyotp.TOTP(self.totp_key).now()
 
     def generate_token(self) -> str:
         if not (self.client_id and self.secret_key and self.totp_key and self.pin and self.fyers_id):
@@ -52,9 +61,10 @@ class FyersAuthManager:
         return access_token
 
     def _get_auth_code_via_browser(self) -> str:
+        encoded_redirect = urllib.parse.quote(self.redirect_uri, safe="")
         login_url = (
             f"https://api-t1.fyers.in/api/v3/generate-authcode"
-            f"?client_id={self.client_id}&redirect_uri={self.redirect_uri}"
+            f"?client_id={self.client_id}&redirect_uri={encoded_redirect}"
             f"&response_type=code&state=sample_state"
         )
 
@@ -72,6 +82,11 @@ class FyersAuthManager:
 
             page.goto(login_url, wait_until="domcontentloaded", timeout=60000)
             page.wait_for_timeout(3000)
+
+            initial_text = page.inner_text("body")
+            if "invalid redirect" in initial_text.lower() or "invalid client" in initial_text.lower():
+                browser.close()
+                raise RuntimeError(f"App Config Error: {initial_text[:150].replace(chr(10), ' ')}")
 
             # Step 1: Switch to 'Client ID' tab
             client_id_tab = page.locator("text='Client ID'").first
@@ -92,10 +107,8 @@ class FyersAuthManager:
             else:
                 submit_btn.click()
 
-            # Wait for Step 3 screen transition
+            # Step 3: Enter Fresh TOTP
             page.wait_for_timeout(3500)
-
-            # Check if there is a "Verify with TOTP" or "Enter TOTP" option button
             totp_switch = page.locator("text=/TOTP/i").first
             if totp_switch.count() > 0 and totp_switch.is_visible():
                 try:
@@ -104,14 +117,13 @@ class FyersAuthManager:
                 except Exception:
                     pass
 
-            # Step 3: Universal TOTP input detection (6 single boxes OR 1 combined box)
             visible_inputs = page.locator("input:visible").all()
             if not visible_inputs:
                 screen_text = page.inner_text("body")[:180].replace("\n", " ")
                 browser.close()
                 raise RuntimeError(f"No inputs on TOTP step. Screen says: {screen_text}")
 
-            current_totp = pyotp.TOTP(self.totp_key).now()
+            current_totp = self._get_fresh_totp()
             if len(visible_inputs) >= 6:
                 for i in range(6):
                     visible_inputs[i].click()
@@ -120,10 +132,11 @@ class FyersAuthManager:
                 visible_inputs[0].click()
                 visible_inputs[0].press_sequentially(current_totp, delay=60)
 
-            page.wait_for_timeout(600)
-            submit_otp = page.locator("#confirmOtpSubmit:visible, button:has-text('Continue'):visible, button:has-text('Verify'):visible, button[type='submit']:visible").first
-            if submit_otp.count() > 0 and not submit_otp.is_disabled():
-                submit_otp.click()
+            page.wait_for_timeout(1500)
+            if "auth_code=" not in page.url:
+                submit_otp = page.locator("#confirmOtpSubmit:visible, button:has-text('Continue'):visible, button:has-text('Verify'):visible, button[type='submit']:visible").first
+                if submit_otp.count() > 0 and not submit_otp.is_disabled():
+                    submit_otp.click()
 
             # Step 4: Enter 4-Digit PIN
             page.wait_for_timeout(3000)
@@ -141,20 +154,22 @@ class FyersAuthManager:
                 pin_inputs[0].click()
                 pin_inputs[0].press_sequentially(self.pin, delay=60)
 
-            page.wait_for_timeout(600)
-            submit_pin = page.locator("#verifyPinSubmit:visible, button:has-text('Continue'):visible, button:has-text('Verify'):visible, button:has-text('Submit'):visible, button[type='submit']:visible").first
-            if submit_pin.count() > 0 and not submit_pin.is_disabled():
-                submit_pin.click()
+            # Allow 2.5s for Fyers auto-submit on 4th PIN digit
+            page.wait_for_timeout(2500)
+            if "auth_code=" not in page.url:
+                submit_pin = page.locator("#verifyPinSubmit:visible, button:has-text('Continue'):visible, button:has-text('Verify'):visible, button:has-text('Submit'):visible, button[type='submit']:visible").first
+                if submit_pin.count() > 0 and not submit_pin.is_disabled():
+                    submit_pin.click()
 
             # Step 5: Wait for Redirect & Extract Auth Code immediately upon URL commit
             try:
-                page.wait_for_url(lambda url: "auth_code=" in url, wait_until="commit", timeout=25000)
+                page.wait_for_url(lambda url: "auth_code=" in url, wait_until="commit", timeout=20000)
             except Exception:
                 curr_url = page.url
                 if "auth_code=" not in curr_url:
-                    screen_msg = page.inner_text("body")[:150].replace("\n", " ")
+                    screen_msg = page.inner_text("body")[:180].replace("\n", " ")
                     browser.close()
-                    raise RuntimeError(f"Redirect stalled at {curr_url[:60]} | Msg: {screen_msg}")
+                    raise RuntimeError(f"Stalled | Screen: {screen_msg}")
 
             final_url = page.url
             browser.close()
