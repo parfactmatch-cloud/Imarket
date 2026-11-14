@@ -1,10 +1,11 @@
 """
 main_jev_orchestrator.py
-Production Entry Point linking Ingestion, Auction Footprint, Multi-Timeframe, and Execution.
+Production Entry Point linking Ingestion, Auction Footprint, Multi-Timeframe Context, and Execution.
 Upgraded with:
-- Real-time Fyers REST API PDH/PDL/PDC auto-fetching
+- Real-time Fyers REST API PDH/PDL/PDC & Weekly/Monthly Profile Construction
 - AdvancedAuctionFootprintEngine (3:1 Stacked Imbalances, Absorption Filter, Single Time-Framing)
-- 30-minute Telegram Heartbeat Telemetry & Auto Market-Close Shutdown (3:30 PM IST)
+- MTFProfileContextBuilder (Calendar-aware Weekly/Monthly VAH/VAL & POC Chop Filter)
+- Sanitized Telegram Alerts (Prevents Markdown 400 parse errors) & 30-Min Heartbeat
 """
 
 import os
@@ -22,6 +23,12 @@ from telegram_remote_controller import TelegramController
 from lag_neutralized_engine import LagNeutralizedEngine, FastBar
 from advanced_auction_footprint_engine import AdvancedAuctionFootprintEngine
 
+try:
+    from mtf_profile_context_builder import MTFProfileContextBuilder, ProfileLevels
+    MTF_AVAILABLE = True
+except ImportError:
+    MTF_AVAILABLE = False
+
 # IST Timezone (UTC + 5:30)
 IST = timezone(timedelta(hours=5, minutes=30))
 
@@ -30,13 +37,29 @@ def get_ist_now() -> datetime:
     return datetime.now(IST)
 
 
-def fetch_previous_day_levels(fyers_client) -> tuple:
+def sanitize_tg_text(text: str) -> str:
+    """Removes Markdown characters that break Telegram API entity parsing."""
+    return str(text).replace("_", " ").replace("*", "").replace("`", "")
+
+
+def fetch_historical_levels(fyers_client) -> dict:
     """
-    Fetches actual PDH, PDL, PDC for NSE:NIFTY50-INDEX via Fyers History API.
+    Fetches actual PDH, PDL, PDC and approximate Weekly/Monthly Value Areas for NSE:NIFTY50-INDEX.
     """
+    levels = {
+        "pdh": 24000.0,
+        "pdl": 23800.0,
+        "pdc": 23900.0,
+        "week_vah": 24100.0,
+        "week_val": 23750.0,
+        "week_poc": 23920.0,
+        "month_vah": 24300.0,
+        "month_val": 23600.0,
+        "month_poc": 23950.0
+    }
     try:
         today = get_ist_now()
-        range_from = (today - timedelta(days=7)).strftime("%Y-%m-%d")
+        range_from = (today - timedelta(days=35)).strftime("%Y-%m-%d")
         range_to = today.strftime("%Y-%m-%d")
 
         data = {
@@ -50,22 +73,39 @@ def fetch_previous_day_levels(fyers_client) -> tuple:
         response = fyers_client.history(data=data)
         candles = response.get("candles", [])
         if len(candles) >= 2:
-            # Second last candle is the previous completed trading session
             prev_candle = candles[-2]
-            pdh = float(prev_candle[2])
-            pdl = float(prev_candle[3])
-            pdc = float(prev_candle[4])
-            print(f"[Levels] Real Nifty Levels Fetched -> PDH: {pdh}, PDL: {pdl}, PDC: {pdc}")
-            return pdh, pdl, pdc
+            levels["pdh"] = float(prev_candle[2])
+            levels["pdl"] = float(prev_candle[3])
+            levels["pdc"] = float(prev_candle[4])
+
+            # Derive Weekly Value Area (last 5 sessions)
+            recent_week = candles[-6:-1] if len(candles) >= 6 else candles[:-1]
+            w_high = max(float(c[2]) for c in recent_week)
+            w_low = min(float(c[3]) for c in recent_week)
+            w_range = w_high - w_low
+            levels["week_vah"] = round(w_high - (0.15 * w_range), 2)
+            levels["week_val"] = round(w_low + (0.15 * w_range), 2)
+            levels["week_poc"] = round((w_high + w_low) / 2.0, 2)
+
+            # Derive Monthly Value Area (last 20 sessions)
+            recent_month = candles[-21:-1] if len(candles) >= 21 else candles[:-1]
+            m_high = max(float(c[2]) for c in recent_month)
+            m_low = min(float(c[3]) for c in recent_month)
+            m_range = m_high - m_low
+            levels["month_vah"] = round(m_high - (0.15 * m_range), 2)
+            levels["month_val"] = round(m_low + (0.15 * m_range), 2)
+            levels["month_poc"] = round((m_high + m_low) / 2.0, 2)
+
+            print(f"[Levels] Real Nifty Levels -> PDH: {levels['pdh']}, PDL: {levels['pdl']}, Week POC: {levels['week_poc']}")
     except Exception as e:
         print(f"[Levels Warning] Historical fetch failed: {e}")
 
-    return 24000.0, 23800.0, 23900.0
+    return levels
 
 
 def start_system():
     print("=" * 60)
-    print(">>> Jev Engine v3.5 (Auction + Footprint Live) Starting...")
+    print(">>> Jev Engine v3.6 (Auction + Footprint + MTF Live) Starting...")
     print("=" * 60)
 
     # 1. Fetch Credentials from Environment Variables / GitHub Secrets
@@ -112,17 +152,28 @@ def start_system():
             token = auth_mgr.get_valid_token()
             print("[Auth] Fyers access token secured successfully.")
         except Exception as e:
+            clean_err = sanitize_tg_text(str(e))[:140]
             print(f"[Auth Error] Failed to generate token: {e}")
-            tg.send_alert("Auth Error", f"Headless token generation failed: {str(e)[:120]}")
+            tg.send_alert("Auth Error", f"Token generation failed: {clean_err}")
 
     # 5. Connect Live Stream if Token is Available
     if token:
         fyers = fyersModel.FyersModel(client_id=fyers_client_id, token=token, is_async=False, log_path="")
-        pdh, pdl, pdc = fetch_previous_day_levels(fyers)
+        levels = fetch_historical_levels(fyers)
+        pdh, pdl, pdc = levels["pdh"], levels["pdl"], levels["pdc"]
+
+        mtf_builder = None
+        if MTF_AVAILABLE:
+            mtf_builder = MTFProfileContextBuilder(
+                prev_month=ProfileLevels(levels["month_vah"], levels["month_val"], levels["month_poc"], []),
+                prev_week=ProfileLevels(levels["week_vah"], levels["week_val"], levels["week_poc"], []),
+                current_week=ProfileLevels(levels["week_vah"], levels["week_val"], levels["week_poc"], []),
+                daily_profile=ProfileLevels(pdh, pdl, pdc, [])
+            )
 
         tg.send_alert(
             "System Online (Live Feed)",
-            f"Jev Engine v3.5 ({mode_label})\nNifty PDH: {pdh} | PDL: {pdl}\nStatus: Live WebSocket & Footprint Active"
+            f"Jev Engine v3.6 ({mode_label})\nNifty PDH: {pdh} | PDL: {pdl}\nWeek POC: {levels['week_poc']} | Status: Live Scanning"
         )
 
         lag_engine = LagNeutralizedEngine(pdh=pdh, pdl=pdl, pdc=pdc)
@@ -155,7 +206,6 @@ def start_system():
                 elapsed_seconds=elapsed_sec
             )
 
-            # Evaluate Footprint (3:1 Stacked Imbalances, Absorption, Poor High/Low)
             fp_bar = fp_engine.evaluate_bar(
                 timestamp=ts_str,
                 open_p=fast_bar.open,
@@ -167,6 +217,18 @@ def start_system():
 
             if state_store.get_system_flag("SYSTEM_PAUSED", "0") == "1":
                 return
+
+            # Check MTF Context & Chop Filter
+            mtf_context = {}
+            if mtf_builder:
+                mtf_context = mtf_builder.evaluate_auction_context(fast_bar.close, get_ist_now())
+                if mtf_context.get("is_chop_risk"):
+                    print(f"[Veto] Price {fast_bar.close} is inside Weekly POC Chop Zone. Trade skipped.")
+                    if not is_early:
+                        bar_ticks.clear()
+                        bar_start_time = time.time()
+                        early_triggered_this_bar = False
+                    return
 
             decision = lag_engine.evaluate_lag_free_execution(
                 current_5m=fast_bar,
@@ -185,9 +247,10 @@ def start_system():
                     early_triggered_this_bar = True
                     atm_strike = round(fast_bar.close / 50) * 50
                     imb_tag = f"Stacked Buy: {len(fp_bar.stacked_buy_imbalances)} lvls" if fp_bar.stacked_buy_imbalances else "CVD Confirmed"
+                    ctx_tag = mtf_context.get("bias", "BREAKOUT")
                     tg.send_alert(
                         "🚀 NIFTY BUY SIGNAL",
-                        f"Spot: {fast_bar.close} | {imb_tag}\nBar Delta: {fp_bar.bar_delta} | CVD: {fp_bar.cumulative_delta}\nStrike: NIFTY {atm_strike} CE"
+                        f"Spot: {fast_bar.close} | {imb_tag}\nContext: {ctx_tag} | Bar Delta: {fp_bar.bar_delta}\nStrike: NIFTY {atm_strike} CE"
                     )
                     router.execute_buy(
                         symbol=f"NSE:NIFTY26NOV{atm_strike}CE",
@@ -208,9 +271,10 @@ def start_system():
                     early_triggered_this_bar = True
                     atm_strike = round(fast_bar.close / 50) * 50
                     imb_tag = f"Stacked Sell: {len(fp_bar.stacked_sell_imbalances)} lvls" if fp_bar.stacked_sell_imbalances else "CVD Confirmed"
+                    ctx_tag = mtf_context.get("bias", "BREAKDOWN")
                     tg.send_alert(
                         "🔻 NIFTY SELL SIGNAL",
-                        f"Spot: {fast_bar.close} | {imb_tag}\nBar Delta: {fp_bar.bar_delta} | CVD: {fp_bar.cumulative_delta}\nStrike: NIFTY {atm_strike} PE"
+                        f"Spot: {fast_bar.close} | {imb_tag}\nContext: {ctx_tag} | Bar Delta: {fp_bar.bar_delta}\nStrike: NIFTY {atm_strike} PE"
                     )
                     router.execute_buy(
                         symbol=f"NSE:NIFTY26NOV{atm_strike}PE",
@@ -302,8 +366,9 @@ def start_system():
 
     else:
         # Fallback Batch Loop if token is unavailable
-        tg.send_alert("System Online (Fallback)", f"Jev Engine v3.5 Started in {mode_label} (No Live Token).")
+        tg.send_alert("System Online (Fallback)", f"Jev Engine v3.6 Started in {mode_label} (No Live Token).")
         print("[Fallback/Paper] Running simulated telemetry baseline...")
+        fallback_engine = LagNeutralizedEngine(pdh=23250.0, pdl=23050.0, pdc=23140.0)
         try:
             iteration = 0
             max_iterations = int(os.environ.get("MAX_ITERATIONS", "10"))
@@ -314,7 +379,7 @@ def start_system():
                     continue
 
                 mock_bar = FastBar("14:24", 23210, 23265, 23205, 23262, 45000, 270)
-                decision = lag_engine = LagNeutralizedEngine(pdh=23250.0, pdl=23050.0, pdc=23140.0).evaluate_lag_free_execution(
+                decision = fallback_engine.evaluate_lag_free_execution(
                     mock_bar, [], dealer_net_dex=125000, cvd_delta=4500
                 )
 
