@@ -1,7 +1,8 @@
 """
 fyers_auth_automation.py
-100% Automated Headless Auth using Playwright (Bypasses Cloudflare 403 WAF).
-Uses :visible locators and 1080p viewport to bypass hidden duplicate inputs on Fyers portal.
+Hybrid Fyers Auth Manager:
+1. Prioritizes direct FYERS_ACCESS_TOKEN if configured.
+2. Attempts Headless Playwright Auth with anti-bot flags and prints page title/diagnostics if blocked by Cloudflare/Captcha.
 """
 
 import os
@@ -29,7 +30,7 @@ class FyersAuthManager:
 
     def generate_token(self) -> str:
         if not (self.client_id and self.secret_key and self.totp_key and self.pin and self.fyers_id):
-            raise ValueError("Credentials missing in Environment Variables. Check GitHub Secrets.")
+            raise ValueError("Credentials missing in Environment Variables.")
 
         auth_code = self._get_auth_code_via_browser()
 
@@ -44,7 +45,7 @@ class FyersAuthManager:
         access_token = res_json.get("access_token", "")
 
         if not access_token:
-            raise RuntimeError(f"Token generation failed: {res_json}")
+            raise RuntimeError(f"Token exchange failed: {res_json}")
 
         with open(self.token_file, "w") as f:
             json.dump({"access_token": access_token}, f)
@@ -59,42 +60,50 @@ class FyersAuthManager:
         )
 
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
+            browser = p.chromium.launch(
+                headless=True,
+                args=["--disable-blink-features=AutomationControlled", "--no-sandbox"]
+            )
             context = browser.new_context(
                 viewport={"width": 1920, "height": 1080},
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
             )
             page = context.new_page()
+            page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
 
             page.goto(login_url, wait_until="domcontentloaded", timeout=60000)
+            page.wait_for_timeout(4000)
 
-            # 1. Target ONLY the visible Client ID input (skips hidden duplicate)
-            client_id_input = page.locator("input#fy_client_id:visible").first
-            client_id_input.wait_for(state="visible", timeout=30000)
+            page_title = page.title()
+            print(f"[Auth Debug] Loaded Page Title: '{page_title}' | URL: {page.url}")
+
+            # Check if any input is present
+            client_id_input = page.locator("input#fy_client_id:visible, input[name='fy_client_id']:visible, input[placeholder*='Client']:visible").first
+            if client_id_input.count() == 0:
+                body_snippet = page.inner_text("body")[:200].replace("\n", " ")
+                browser.close()
+                raise RuntimeError(f"Login input blocked/missing. Title: {page_title} | Content: {body_snippet}")
+
             client_id_input.fill(self.fyers_id)
+            page.locator("#clientIdSubmit:visible, button:has-text('Continue'):visible").first.click()
 
-            submit_btn = page.locator("#clientIdSubmit:visible").first
-            submit_btn.click()
-
-            # 2. Enter TOTP in visible inputs
-            page.locator(".otp-container input:visible").first.wait_for(state="visible", timeout=30000)
+            # Enter TOTP
+            page.locator(".otp-container input:visible").first.wait_for(state="visible", timeout=20000)
             current_totp = pyotp.TOTP(self.totp_key).now()
             otp_inputs = page.locator(".otp-container input:visible").all()
             for i, char in enumerate(current_totp):
                 otp_inputs[i].fill(char)
-
             page.locator("#confirmOtpSubmit:visible").first.click()
 
-            # 3. Enter 4-Digit PIN in visible inputs
-            page.locator(".pin-container input:visible").first.wait_for(state="visible", timeout=30000)
+            # Enter PIN
+            page.locator(".pin-container input:visible").first.wait_for(state="visible", timeout=20000)
             pin_inputs = page.locator(".pin-container input:visible").all()
             for i, char in enumerate(self.pin):
                 pin_inputs[i].fill(char)
-
             page.locator("#verifyPinSubmit:visible").first.click()
 
-            # 4. Extract Auth Code from Redirect URL
-            page.wait_for_url(lambda url: "auth_code=" in url, timeout=30000)
+            # Extract Auth Code
+            page.wait_for_url(lambda url: "auth_code=" in url, timeout=25000)
             final_url = page.url
             browser.close()
 
@@ -108,6 +117,10 @@ class FyersAuthManager:
             return auth_code
 
     def get_valid_token(self) -> str:
+        env_token = os.environ.get("FYERS_ACCESS_TOKEN", "").strip()
+        if env_token:
+            return env_token
+
         if os.path.exists(self.token_file):
             try:
                 with open(self.token_file, "r") as f:
