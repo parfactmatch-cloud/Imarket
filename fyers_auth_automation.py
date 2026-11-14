@@ -1,7 +1,7 @@
 """
 fyers_auth_automation.py
 100% Automated Headless Auth using Playwright.
-Uses human-like keystroke typing (press_sequentially) so Fyers React/Angular form enables submit buttons.
+Handles Fyers' new Login UI: Client ID Tab -> Sequential Typing -> Universal TOTP/PIN Detection.
 """
 
 import os
@@ -29,10 +29,7 @@ class FyersAuthManager:
 
     def generate_token(self) -> str:
         if not (self.client_id and self.secret_key and self.totp_key and self.pin and self.fyers_id):
-            raise ValueError(
-                f"Missing Secrets! client_id={bool(self.client_id)}, fyers_id={bool(self.fyers_id)}, "
-                f"totp={bool(self.totp_key)}, pin={bool(self.pin)}"
-            )
+            raise ValueError("Missing Secrets in GitHub Environment.")
 
         auth_code = self._get_auth_code_via_browser()
 
@@ -76,13 +73,13 @@ class FyersAuthManager:
             page.goto(login_url, wait_until="domcontentloaded", timeout=60000)
             page.wait_for_timeout(3000)
 
-            # Step 1: Switch from 'Mobile number' tab to 'Client ID' tab
+            # Step 1: Switch to 'Client ID' tab
             client_id_tab = page.locator("text='Client ID'").first
             if client_id_tab.count() > 0:
                 client_id_tab.click()
                 page.wait_for_timeout(1000)
 
-            # Step 2: Type Client ID sequentially like a human so the Continue button enables
+            # Step 2: Type Client ID sequentially
             client_id_input = page.locator("input#fy_client_id:visible, input[name='fy_client_id']:visible, input[type='text']:visible").first
             client_id_input.wait_for(state="visible", timeout=20000)
             client_id_input.click()
@@ -95,37 +92,57 @@ class FyersAuthManager:
             else:
                 submit_btn.click()
 
-            # Step 3: Enter TOTP sequentially
-            page.locator(".otp-container input:visible, input[type='tel']:visible, input[maxlength='1']:visible").first.wait_for(state="visible", timeout=20000)
-            current_totp = pyotp.TOTP(self.totp_key).now()
-            otp_inputs = page.locator(".otp-container input:visible, input[maxlength='1']:visible").all()
-            if len(otp_inputs) >= 6:
-                for i in range(6):
-                    otp_inputs[i].click()
-                    otp_inputs[i].press_sequentially(current_totp[i], delay=50)
-            else:
-                otp_inputs[0].click()
-                otp_inputs[0].press_sequentially(current_totp, delay=50)
+            # Wait for Step 3 screen transition
+            page.wait_for_timeout(3500)
 
-            page.wait_for_timeout(500)
-            submit_otp = page.locator("#confirmOtpSubmit:visible, button:has-text('Continue'):visible, button:has-text('Verify'):visible").first
+            # Check if there is a "Verify with TOTP" or "Enter TOTP" option button
+            totp_switch = page.locator("text=/TOTP/i").first
+            if totp_switch.count() > 0 and totp_switch.is_visible():
+                try:
+                    totp_switch.click()
+                    page.wait_for_timeout(1000)
+                except Exception:
+                    pass
+
+            # Step 3: Universal TOTP input detection (6 single boxes OR 1 combined text/number box)
+            visible_inputs = page.locator("input:visible").all()
+            if not visible_inputs:
+                screen_text = page.inner_text("body")[:180].replace("\n", " ")
+                browser.close()
+                raise RuntimeError(f"No inputs on TOTP step. Screen says: {screen_text}")
+
+            current_totp = pyotp.TOTP(self.totp_key).now()
+            if len(visible_inputs) >= 6:
+                for i in range(6):
+                    visible_inputs[i].click()
+                    visible_inputs[i].press_sequentially(current_totp[i], delay=50)
+            else:
+                visible_inputs[0].click()
+                visible_inputs[0].press_sequentially(current_totp, delay=60)
+
+            page.wait_for_timeout(600)
+            submit_otp = page.locator("#confirmOtpSubmit:visible, button:has-text('Continue'):visible, button:has-text('Verify'):visible, button[type='submit']:visible").first
             if submit_otp.count() > 0 and not submit_otp.is_disabled():
                 submit_otp.click()
 
-            # Step 4: Enter 4-Digit PIN sequentially
-            page.wait_for_timeout(1500)
-            page.locator(".pin-container input:visible, input[type='password']:visible, input[maxlength='1']:visible").first.wait_for(state="visible", timeout=20000)
-            pin_inputs = page.locator(".pin-container input:visible, input[maxlength='1']:visible").all()
+            # Step 4: Enter 4-Digit PIN
+            page.wait_for_timeout(3000)
+            pin_inputs = page.locator("input:visible").all()
+            if not pin_inputs:
+                screen_text = page.inner_text("body")[:180].replace("\n", " ")
+                browser.close()
+                raise RuntimeError(f"No inputs on PIN step. Screen says: {screen_text}")
+
             if len(pin_inputs) >= 4:
                 for i in range(4):
                     pin_inputs[i].click()
                     pin_inputs[i].press_sequentially(self.pin[i], delay=50)
             else:
                 pin_inputs[0].click()
-                pin_inputs[0].press_sequentially(self.pin, delay=50)
+                pin_inputs[0].press_sequentially(self.pin, delay=60)
 
-            page.wait_for_timeout(500)
-            submit_pin = page.locator("#verifyPinSubmit:visible, button:has-text('Continue'):visible, button:has-text('Verify'):visible, button:has-text('Submit'):visible").first
+            page.wait_for_timeout(600)
+            submit_pin = page.locator("#verifyPinSubmit:visible, button:has-text('Continue'):visible, button:has-text('Verify'):visible, button:has-text('Submit'):visible, button[type='submit']:visible").first
             if submit_pin.count() > 0 and not submit_pin.is_disabled():
                 submit_pin.click()
 
