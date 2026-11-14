@@ -2,10 +2,11 @@
 main_jev_orchestrator.py
 Production Entry Point linking Ingestion, Auction Footprint, Multi-Timeframe Context, and Execution.
 Upgraded with:
+- Exact Fyers Redirect URI (`redirect-uri-index.html`) matching App B44Q0QQQMA-200
 - Real-time Fyers REST API PDH/PDL/PDC & Weekly/Monthly Profile Construction
 - AdvancedAuctionFootprintEngine (3:1 Stacked Imbalances, Absorption Filter, Single Time-Framing)
 - MTFProfileContextBuilder (Calendar-aware Weekly/Monthly VAH/VAL & POC Chop Filter)
-- Sanitized Telegram Alerts (Prevents Markdown 400 parse errors) & 30-Min Heartbeat
+- Sanitized Telegram Alerts & 30-Min Heartbeat
 """
 
 import os
@@ -44,7 +45,7 @@ def sanitize_tg_text(text: str) -> str:
 
 def fetch_historical_levels(fyers_client) -> dict:
     """
-    Fetches actual PDH, PDL, PDC and approximate Weekly/Monthly Value Areas for NSE:NIFTY50-INDEX.
+    Fetches actual PDH, PDL, PDC and Weekly/Monthly Value Areas for NSE:NIFTY50-INDEX.
     """
     levels = {
         "pdh": 24000.0,
@@ -144,7 +145,7 @@ def start_system():
             auth_mgr = FyersAuthManager(
                 client_id=fyers_client_id,
                 secret_key=fyers_secret_key,
-                redirect_uri="https://trade.fyers.in/api-login/redirect-uri/index.html",
+                redirect_uri="https://trade.fyers.in/api-login/redirect-uri-index.html",
                 fyers_id=fyers_id,
                 pin=fyers_pin,
                 totp_key=fyers_totp_key
