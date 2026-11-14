@@ -1,7 +1,7 @@
 """
 fyers_auth_automation.py
 100% Automated Headless Auth using Playwright.
-Handles Fyers' new Login UI: Client ID Tab -> Sequential Typing -> Universal TOTP/PIN Detection.
+Handles Fyers' new Login UI: Client ID Tab -> Sequential Typing -> Universal TOTP/PIN Detection -> Instant URL Commit Capture.
 """
 
 import os
@@ -104,7 +104,7 @@ class FyersAuthManager:
                 except Exception:
                     pass
 
-            # Step 3: Universal TOTP input detection (6 single boxes OR 1 combined text/number box)
+            # Step 3: Universal TOTP input detection (6 single boxes OR 1 combined box)
             visible_inputs = page.locator("input:visible").all()
             if not visible_inputs:
                 screen_text = page.inner_text("body")[:180].replace("\n", " ")
@@ -146,8 +146,16 @@ class FyersAuthManager:
             if submit_pin.count() > 0 and not submit_pin.is_disabled():
                 submit_pin.click()
 
-            # Step 5: Wait for Redirect & Extract Auth Code
-            page.wait_for_url(lambda url: "auth_code=" in url, timeout=25000)
+            # Step 5: Wait for Redirect & Extract Auth Code immediately upon URL commit
+            try:
+                page.wait_for_url(lambda url: "auth_code=" in url, wait_until="commit", timeout=25000)
+            except Exception:
+                curr_url = page.url
+                if "auth_code=" not in curr_url:
+                    screen_msg = page.inner_text("body")[:150].replace("\n", " ")
+                    browser.close()
+                    raise RuntimeError(f"Redirect stalled at {curr_url[:60]} | Msg: {screen_msg}")
+
             final_url = page.url
             browser.close()
 
