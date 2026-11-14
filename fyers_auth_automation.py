@@ -1,8 +1,7 @@
 """
 fyers_auth_automation.py
-Hybrid Fyers Auth Manager:
-1. Prioritizes direct FYERS_ACCESS_TOKEN if configured.
-2. Attempts Headless Playwright Auth with anti-bot flags and prints page title/diagnostics if blocked by Cloudflare/Captcha.
+100% Automated Headless Auth using Playwright.
+Handles Fyers' new Login UI by switching from 'Mobile number (+91)' tab to 'Client ID' tab first.
 """
 
 import os
@@ -72,37 +71,50 @@ class FyersAuthManager:
             page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
 
             page.goto(login_url, wait_until="domcontentloaded", timeout=60000)
-            page.wait_for_timeout(4000)
+            page.wait_for_timeout(3000)
 
-            page_title = page.title()
-            print(f"[Auth Debug] Loaded Page Title: '{page_title}' | URL: {page.url}")
+            # Step 1: Switch from 'Mobile number' tab to 'Client ID' tab
+            client_id_tab = page.locator("text='Client ID'").first
+            if client_id_tab.count() > 0:
+                client_id_tab.click()
+                page.wait_for_timeout(1000)
 
-            # Check if any input is present
-            client_id_input = page.locator("input#fy_client_id:visible, input[name='fy_client_id']:visible, input[placeholder*='Client']:visible").first
-            if client_id_input.count() == 0:
-                body_snippet = page.inner_text("body")[:200].replace("\n", " ")
-                browser.close()
-                raise RuntimeError(f"Login input blocked/missing. Title: {page_title} | Content: {body_snippet}")
-
+            # Step 2: Fill Client ID
+            client_id_input = page.locator("input#fy_client_id:visible, input[name='fy_client_id']:visible, input[type='text']:visible").first
+            client_id_input.wait_for(state="visible", timeout=20000)
             client_id_input.fill(self.fyers_id)
+
             page.locator("#clientIdSubmit:visible, button:has-text('Continue'):visible").first.click()
 
-            # Enter TOTP
-            page.locator(".otp-container input:visible").first.wait_for(state="visible", timeout=20000)
+            # Step 3: Enter TOTP
+            page.locator(".otp-container input:visible, input[type='tel']:visible, input[maxlength='1']:visible").first.wait_for(state="visible", timeout=20000)
             current_totp = pyotp.TOTP(self.totp_key).now()
-            otp_inputs = page.locator(".otp-container input:visible").all()
-            for i, char in enumerate(current_totp):
-                otp_inputs[i].fill(char)
-            page.locator("#confirmOtpSubmit:visible").first.click()
+            otp_inputs = page.locator(".otp-container input:visible, input[maxlength='1']:visible").all()
+            if len(otp_inputs) >= 6:
+                for i in range(6):
+                    otp_inputs[i].fill(current_totp[i])
+            else:
+                otp_inputs[0].fill(current_totp)
 
-            # Enter PIN
-            page.locator(".pin-container input:visible").first.wait_for(state="visible", timeout=20000)
-            pin_inputs = page.locator(".pin-container input:visible").all()
-            for i, char in enumerate(self.pin):
-                pin_inputs[i].fill(char)
-            page.locator("#verifyPinSubmit:visible").first.click()
+            submit_otp = page.locator("#confirmOtpSubmit:visible, button:has-text('Continue'):visible, button:has-text('Verify'):visible").first
+            if submit_otp.count() > 0:
+                submit_otp.click()
 
-            # Extract Auth Code
+            # Step 4: Enter 4-Digit PIN
+            page.wait_for_timeout(1500)
+            page.locator(".pin-container input:visible, input[type='password']:visible, input[maxlength='1']:visible").first.wait_for(state="visible", timeout=20000)
+            pin_inputs = page.locator(".pin-container input:visible, input[maxlength='1']:visible").all()
+            if len(pin_inputs) >= 4:
+                for i in range(4):
+                    pin_inputs[i].fill(self.pin[i])
+            else:
+                pin_inputs[0].fill(self.pin)
+
+            submit_pin = page.locator("#verifyPinSubmit:visible, button:has-text('Continue'):visible, button:has-text('Verify'):visible, button:has-text('Submit'):visible").first
+            if submit_pin.count() > 0:
+                submit_pin.click()
+
+            # Step 5: Wait for Redirect & Extract Auth Code
             page.wait_for_url(lambda url: "auth_code=" in url, timeout=25000)
             final_url = page.url
             browser.close()
