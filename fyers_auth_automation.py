@@ -1,7 +1,7 @@
 """
 fyers_auth_automation.py
 100% Automated Headless Auth using Playwright (Bypasses Cloudflare 403 WAF).
-Generates daily access token automatically without manual intervention.
+Uses :visible locators and 1080p viewport to bypass hidden duplicate inputs on Fyers portal.
 """
 
 import os
@@ -31,10 +31,8 @@ class FyersAuthManager:
         if not (self.client_id and self.secret_key and self.totp_key and self.pin and self.fyers_id):
             raise ValueError("Credentials missing in Environment Variables. Check GitHub Secrets.")
 
-        # Step 1: Headless Playwright se Auth Code hasil karna
         auth_code = self._get_auth_code_via_browser()
 
-        # Step 2: Auth Code ko Access Token ke liye exchange karna
         app_id_hash = self._get_app_id_hash()
         token_payload = {
             "grant_type": "authorization_code",
@@ -63,34 +61,39 @@ class FyersAuthManager:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
             context = browser.new_context(
+                viewport={"width": 1920, "height": 1080},
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
             )
             page = context.new_page()
 
-            # Fix: 'domcontentloaded' used to prevent 30s networkidle timeout
             page.goto(login_url, wait_until="domcontentloaded", timeout=60000)
 
-            # 1. Enter Client ID
-            page.wait_for_selector("#fy_client_id", timeout=30000)
-            page.fill("#fy_client_id", self.fyers_id)
-            page.click("#clientIdSubmit")
+            # 1. Target ONLY the visible Client ID input (skips hidden duplicate)
+            client_id_input = page.locator("input#fy_client_id:visible").first
+            client_id_input.wait_for(state="visible", timeout=30000)
+            client_id_input.fill(self.fyers_id)
 
-            # 2. Enter TOTP
-            page.wait_for_selector(".otp-container input", timeout=30000)
+            submit_btn = page.locator("#clientIdSubmit:visible").first
+            submit_btn.click()
+
+            # 2. Enter TOTP in visible inputs
+            page.locator(".otp-container input:visible").first.wait_for(state="visible", timeout=30000)
             current_totp = pyotp.TOTP(self.totp_key).now()
-            inputs = page.query_selector_all(".otp-container input")
+            otp_inputs = page.locator(".otp-container input:visible").all()
             for i, char in enumerate(current_totp):
-                inputs[i].fill(char)
-            page.click("#confirmOtpSubmit")
+                otp_inputs[i].fill(char)
 
-            # 3. Enter PIN
-            page.wait_for_selector(".pin-container input", timeout=30000)
-            pin_inputs = page.query_selector_all(".pin-container input")
+            page.locator("#confirmOtpSubmit:visible").first.click()
+
+            # 3. Enter 4-Digit PIN in visible inputs
+            page.locator(".pin-container input:visible").first.wait_for(state="visible", timeout=30000)
+            pin_inputs = page.locator(".pin-container input:visible").all()
             for i, char in enumerate(self.pin):
                 pin_inputs[i].fill(char)
-            page.click("#verifyPinSubmit")
 
-            # 4. Wait for redirect and parse auth_code
+            page.locator("#verifyPinSubmit:visible").first.click()
+
+            # 4. Extract Auth Code from Redirect URL
             page.wait_for_url(lambda url: "auth_code=" in url, timeout=30000)
             final_url = page.url
             browser.close()
