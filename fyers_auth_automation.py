@@ -1,7 +1,7 @@
 """
 fyers_auth_automation.py
 100% Automated Headless Auth using Playwright.
-Handles Fyers' new Login UI by switching from 'Mobile number (+91)' tab to 'Client ID' tab first.
+Uses human-like keystroke typing (press_sequentially) so Fyers React/Angular form enables submit buttons.
 """
 
 import os
@@ -18,7 +18,7 @@ class FyersAuthManager:
         self.client_id = client_id.strip() if client_id else ""
         self.secret_key = secret_key.strip() if secret_key else ""
         self.redirect_uri = redirect_uri.strip() if redirect_uri else ""
-        self.fyers_id = fyers_id.strip() if fyers_id else ""
+        self.fyers_id = fyers_id.strip().upper() if fyers_id else ""
         self.pin = pin.strip() if pin else ""
         self.totp_key = totp_key.strip().replace(" ", "") if totp_key else ""
         self.token_file = "fyers_access_token.json"
@@ -29,7 +29,10 @@ class FyersAuthManager:
 
     def generate_token(self) -> str:
         if not (self.client_id and self.secret_key and self.totp_key and self.pin and self.fyers_id):
-            raise ValueError("Credentials missing in Environment Variables.")
+            raise ValueError(
+                f"Missing Secrets! client_id={bool(self.client_id)}, fyers_id={bool(self.fyers_id)}, "
+                f"totp={bool(self.totp_key)}, pin={bool(self.pin)}"
+            )
 
         auth_code = self._get_auth_code_via_browser()
 
@@ -79,39 +82,51 @@ class FyersAuthManager:
                 client_id_tab.click()
                 page.wait_for_timeout(1000)
 
-            # Step 2: Fill Client ID
+            # Step 2: Type Client ID sequentially like a human so the Continue button enables
             client_id_input = page.locator("input#fy_client_id:visible, input[name='fy_client_id']:visible, input[type='text']:visible").first
             client_id_input.wait_for(state="visible", timeout=20000)
-            client_id_input.fill(self.fyers_id)
+            client_id_input.click()
+            client_id_input.press_sequentially(self.fyers_id, delay=80)
+            page.wait_for_timeout(500)
 
-            page.locator("#clientIdSubmit:visible, button:has-text('Continue'):visible").first.click()
+            submit_btn = page.locator("#clientIdSubmit:visible, button:has-text('Continue'):visible").first
+            if submit_btn.is_disabled():
+                client_id_input.press("Enter")
+            else:
+                submit_btn.click()
 
-            # Step 3: Enter TOTP
+            # Step 3: Enter TOTP sequentially
             page.locator(".otp-container input:visible, input[type='tel']:visible, input[maxlength='1']:visible").first.wait_for(state="visible", timeout=20000)
             current_totp = pyotp.TOTP(self.totp_key).now()
             otp_inputs = page.locator(".otp-container input:visible, input[maxlength='1']:visible").all()
             if len(otp_inputs) >= 6:
                 for i in range(6):
-                    otp_inputs[i].fill(current_totp[i])
+                    otp_inputs[i].click()
+                    otp_inputs[i].press_sequentially(current_totp[i], delay=50)
             else:
-                otp_inputs[0].fill(current_totp)
+                otp_inputs[0].click()
+                otp_inputs[0].press_sequentially(current_totp, delay=50)
 
+            page.wait_for_timeout(500)
             submit_otp = page.locator("#confirmOtpSubmit:visible, button:has-text('Continue'):visible, button:has-text('Verify'):visible").first
-            if submit_otp.count() > 0:
+            if submit_otp.count() > 0 and not submit_otp.is_disabled():
                 submit_otp.click()
 
-            # Step 4: Enter 4-Digit PIN
+            # Step 4: Enter 4-Digit PIN sequentially
             page.wait_for_timeout(1500)
             page.locator(".pin-container input:visible, input[type='password']:visible, input[maxlength='1']:visible").first.wait_for(state="visible", timeout=20000)
             pin_inputs = page.locator(".pin-container input:visible, input[maxlength='1']:visible").all()
             if len(pin_inputs) >= 4:
                 for i in range(4):
-                    pin_inputs[i].fill(self.pin[i])
+                    pin_inputs[i].click()
+                    pin_inputs[i].press_sequentially(self.pin[i], delay=50)
             else:
-                pin_inputs[0].fill(self.pin)
+                pin_inputs[0].click()
+                pin_inputs[0].press_sequentially(self.pin, delay=50)
 
+            page.wait_for_timeout(500)
             submit_pin = page.locator("#verifyPinSubmit:visible, button:has-text('Continue'):visible, button:has-text('Verify'):visible, button:has-text('Submit'):visible").first
-            if submit_pin.count() > 0:
+            if submit_pin.count() > 0 and not submit_pin.is_disabled():
                 submit_pin.click()
 
             # Step 5: Wait for Redirect & Extract Auth Code
