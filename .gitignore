@@ -1,0 +1,10 @@
+# Secrets and runtime state -- never commit these.
+fyers_access_token.json
+engine_state.db
+engine_state.db-wal
+engine_state.db-shm
+.env
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/

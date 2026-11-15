@@ -8,10 +8,20 @@ import os
 import time
 import json
 import hashlib
+import logging
 import urllib.parse
+from datetime import datetime, timezone, timedelta
 import pyotp
 import requests
 from playwright.sync_api import sync_playwright
+
+logger = logging.getLogger(__name__)
+
+IST = timezone(timedelta(hours=5, minutes=30))
+TOKEN_URL = "https://api-t1.fyers.in/api/v3/token"
+# Fyers access tokens expire daily. A cached token is only trusted
+# when it was saved today (IST); anything older is regenerated.
+REQUEST_TIMEOUT_SECONDS = 30
 
 
 class FyersAuthManager:
@@ -48,15 +58,31 @@ class FyersAuthManager:
             "appIdHash": app_id_hash,
             "code": auth_code
         }
-        res = requests.post("https://api-t1.fyers.in/api/v3/token", json=token_payload)
-        res_json = res.json()
+        res = requests.post(
+            TOKEN_URL, json=token_payload, timeout=REQUEST_TIMEOUT_SECONDS
+        )
+        if res.status_code != 200:
+            raise RuntimeError(
+                f"Token exchange failed: HTTP {res.status_code}: {res.text[:200]}"
+            )
+        try:
+            res_json = res.json()
+        except ValueError as exc:
+            raise RuntimeError(f"Token exchange returned non-JSON: {exc}") from exc
         access_token = res_json.get("access_token", "")
 
         if not access_token:
             raise RuntimeError(f"Token exchange failed: {res_json}")
 
         with open(self.token_file, "w") as f:
-            json.dump({"access_token": access_token}, f)
+            # saved_at is how get_valid_token knows the token's age.
+            json.dump(
+                {
+                    "access_token": access_token,
+                    "saved_at": datetime.now(timezone.utc).isoformat(),
+                },
+                f,
+            )
 
         return access_token
 
@@ -114,8 +140,8 @@ class FyersAuthManager:
                 try:
                     totp_switch.click()
                     page.wait_for_timeout(1000)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.warning("TOTP switch click failed (continuing): %s", exc)
 
             visible_inputs = page.locator("input:visible").all()
             if not visible_inputs:
@@ -164,7 +190,8 @@ class FyersAuthManager:
             # Step 5: Wait for Redirect & Extract Auth Code immediately upon URL commit
             try:
                 page.wait_for_url(lambda url: "auth_code=" in url, wait_until="commit", timeout=20000)
-            except Exception:
+            except Exception as exc:
+                logger.warning("Timed out waiting for auth_code redirect: %s", exc)
                 curr_url = page.url
                 if "auth_code=" not in curr_url:
                     screen_msg = page.inner_text("body")[:180].replace("\n", " ")
@@ -193,8 +220,26 @@ class FyersAuthManager:
                 with open(self.token_file, "r") as f:
                     data = json.load(f)
                     tok = data.get("access_token")
-                    if tok:
+                    saved_at = data.get("saved_at")
+                    if tok and self._token_saved_today(saved_at):
                         return tok
-            except Exception:
-                pass
+                    # A token from a previous day (or with no saved date)
+                    # is expired: Fyers tokens last one day. Fall through
+                    # to a fresh login instead of reusing it.
+                    logger.info("Cached Fyers token is stale; generating a fresh token")
+            except (OSError, ValueError) as exc:
+                logger.warning("Could not read cached token file: %s", exc)
         return self.generate_token()
+
+    @staticmethod
+    def _token_saved_today(saved_at) -> bool:
+        """True only when ``saved_at`` (ISO timestamp) is today in IST."""
+        if not saved_at:
+            return False
+        try:
+            saved = datetime.fromisoformat(str(saved_at))
+        except ValueError:
+            return False
+        if saved.tzinfo is None:
+            saved = saved.replace(tzinfo=timezone.utc)
+        return saved.astimezone(IST).date() == datetime.now(IST).date()

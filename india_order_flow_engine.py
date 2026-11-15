@@ -1,6 +1,10 @@
 """
 india_order_flow_engine.py
 Real-time Cumulative Volume Delta (CVD) and Microstructure Imbalance Engine.
+
+NOTE: NOT wired into the live path. The orchestrator uses
+AdvancedAuctionFootprintEngine for CVD instead. Kept as a standalone
+library module; see README "What is not in the live path".
 """
 
 from dataclasses import dataclass

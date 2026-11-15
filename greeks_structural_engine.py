@@ -30,7 +30,8 @@ class StructuralSignal:
     timestamp: str
     compression_state: str  # "NR4", "NR7", "NORMAL"
     regime: str             # "SHORT_GAMMA_EXPANSION", "LONG_GAMMA_PINNING"
-    setup_trigger: str      # "MOMENTUM_SHORT", "MEAN_REVERSION_FADE", "NO_TRADE"
+    # "MOMENTUM_SHORT", "MEAN_REVERSION_FADE", "PREPARE_BREAKOUT", "NO_TRADE"
+    setup_trigger: str
     invalidation_level: float
 
 

@@ -1,6 +1,10 @@
 """
 gamma_blast_detector.py
 Zero-to-Hero (20x-50x Gamma Cascade) Trigger Detector for Indian 0DTE Expiry.
+Active window: 2:00 PM - 3:08 PM IST (matches the code below).
+
+NOTE: this detector is NOT wired into the live path (see README).
+It is a standalone library module; the orchestrator does not call it.
 """
 
 from dataclasses import dataclass
@@ -42,7 +46,7 @@ class GammaBlastDetector:
         strike_data: StrikeTelemetry,
         wall_strike: float
     ) -> Optional[BlastSignal]:
-        # 1. Time Window: 2:00 PM to 3:05 PM (before RMS square-off)
+        # 1. Time Window: 2:00 PM to 3:08 PM (before RMS square-off)
         hour, minute = map(int, current_time_str.split(":"))
         is_expiry_blast_window = (hour == 14 and minute >= 0) or (hour == 15 and minute <= 8)
         if not is_expiry_blast_window:
