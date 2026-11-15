@@ -1,34 +1,67 @@
 """
 main_jev_orchestrator.py
 Production Entry Point linking Ingestion, Auction Footprint, Multi-Timeframe Context, and Execution.
-Upgraded with:
-- Official Fyers Redirect URI (`redirect-uri/index.html`) matching Fyers API v3 standards
-- Real-time Fyers REST API PDH/PDL/PDC & Weekly/Monthly Profile Construction
-- AdvancedAuctionFootprintEngine (3:1 Stacked Imbalances, Absorption Filter, Single Time-Framing)
-- MTFProfileContextBuilder (Calendar-aware Weekly/Monthly VAH/VAL & POC Chop Filter)
-- Sanitized Telegram Alerts & 30-Min Heartbeat
+
+Fixes applied over v3.6 (see README "What was fixed"):
+- 5-minute bars are accumulated and passed to the lag engine, so its
+  trend/boundary checks can actually fire (previously it was always
+  called with an empty history and could only return HOLD).
+- The authenticated Fyers client is wired into the ExecutionRouter
+  after login (previously it stayed None, so live execution was
+  unreachable).
+- Orders are priced off the *option premium* fetched from Fyers, not
+  the NIFTY spot; stop-loss/targets are premium levels.
+- Dealer gamma comes from IndiaGEXEngine on the live option chain,
+  not a hardcoded constant; if the chain cannot be fetched, no
+  signal is generated.
+- Option symbols use the computed weekly (Thursday) expiry, not a
+  hardcoded "26NOV".
+- A position monitor exits on stop-loss / targets and squares off
+  before the close; /panic exits at the current market price.
+- Risk controls (max daily loss, max trades/day, one open position,
+  cash/balance checks) are enforced by the router.
+- If historical levels cannot be fetched, trading is paused and an
+  alert is sent instead of trading on stale hardcoded defaults.
+- Shutdown is graceful: the state store is checkpointed and closed
+  instead of os._exit(0).
 """
 
+import logging
 import os
-import sys
-import time
 import threading
+import time
 from datetime import datetime, timedelta, timezone
+
 from fyers_apiv3 import fyersModel
 from fyers_apiv3.FyersWebsocket import data_ws
 
-from fyers_auth_automation import FyersAuthManager
+from config import (
+    BAR_SECONDS,
+    EARLY_TRIGGER_SECONDS,
+    MONITOR_CHECK_SECONDS,
+    SL_FRACTION,
+    T1_FRACTION,
+    T2_FRACTION,
+    JevConfig,
+    setup_logging,
+)
 from engine_state_store import EngineStateStore
 from execution_broker_interface import ExecutionRouter
-from telegram_remote_controller import TelegramController
+from expiry import next_weekly_expiry, option_symbol
+from fyers_auth_automation import FyersAuthManager
 from lag_neutralized_engine import LagNeutralizedEngine, FastBar
 from advanced_auction_footprint_engine import AdvancedAuctionFootprintEngine
+from market_data import compute_dealer_net_dex, get_option_quote
+from position_monitor import PositionMonitor
+from telegram_remote_controller import TelegramController
 
 try:
     from mtf_profile_context_builder import MTFProfileContextBuilder, ProfileLevels
     MTF_AVAILABLE = True
 except ImportError:
     MTF_AVAILABLE = False
+
+logger = logging.getLogger(__name__)
 
 # IST Timezone (UTC + 5:30)
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -43,71 +76,121 @@ def sanitize_tg_text(text: str) -> str:
     return str(text).replace("_", " ").replace("*", "").replace("`", "")
 
 
-def fetch_historical_levels(fyers_client) -> dict:
+def _profile_from_candles(candles):
+    """Crude value-area proxy from a candle window (see README limits).
+
+    This is NOT a volume-derived value area: VAH/VAL are the high/low
+    inset by 15% of the range and POC is the midpoint. It is kept only
+    because the MTF builder consumes it; do not treat it as a real
+    volume profile.
     """
-    Fetches actual PDH, PDL, PDC and Weekly/Monthly Value Areas for NSE:NIFTY50-INDEX.
+    high = max(float(c[2]) for c in candles)
+    low = min(float(c[3]) for c in candles)
+    rng = high - low
+    return {
+        "vah": round(high - (0.15 * rng), 2),
+        "val": round(low + (0.15 * rng), 2),
+        "poc": round((high + low) / 2.0, 2),
+    }
+
+
+def fetch_historical_levels(fyers_client):
+    """
+    Fetches actual PDH, PDL, PDC and Weekly/Monthly profile levels.
+
+    Returns (levels, ok). ``ok`` is False when the history call fails
+    or returns too few candles -- callers must NOT trade on the
+    defaults in that case (see start_system).
     """
     levels = {
-        "pdh": 24000.0,
-        "pdl": 23800.0,
-        "pdc": 23900.0,
-        "week_vah": 24100.0,
-        "week_val": 23750.0,
-        "week_poc": 23920.0,
-        "month_vah": 24300.0,
-        "month_val": 23600.0,
-        "month_poc": 23950.0
+        "pdh": 24000.0, "pdl": 23800.0, "pdc": 23900.0,
+        "week_vah": 24100.0, "week_val": 23750.0, "week_poc": 23920.0,
+        "prev_week_vah": 24100.0, "prev_week_val": 23750.0, "prev_week_poc": 23920.0,
+        "month_vah": 24300.0, "month_val": 23600.0, "month_poc": 23950.0,
+        "prev_month_vah": 24300.0, "prev_month_val": 23600.0, "prev_month_poc": 23950.0,
     }
     try:
         today = get_ist_now()
-        range_from = (today - timedelta(days=35)).strftime("%Y-%m-%d")
+        range_from = (today - timedelta(days=42)).strftime("%Y-%m-%d")
         range_to = today.strftime("%Y-%m-%d")
-
         data = {
             "symbol": "NSE:NIFTY50-INDEX",
             "resolution": "D",
             "date_format": "1",
             "range_from": range_from,
             "range_to": range_to,
-            "cont_flag": "1"
+            "cont_flag": "1",
         }
         response = fyers_client.history(data=data)
         candles = response.get("candles", [])
-        if len(candles) >= 2:
-            prev_candle = candles[-2]
-            levels["pdh"] = float(prev_candle[2])
-            levels["pdl"] = float(prev_candle[3])
-            levels["pdc"] = float(prev_candle[4])
+        if len(candles) < 2:
+            logger.error("Historical fetch returned only %d candles; levels unusable", len(candles))
+            return levels, False
 
-            # Derive Weekly Value Area (last 5 sessions)
-            recent_week = candles[-6:-1] if len(candles) >= 6 else candles[:-1]
-            w_high = max(float(c[2]) for c in recent_week)
-            w_low = min(float(c[3]) for c in recent_week)
-            w_range = w_high - w_low
-            levels["week_vah"] = round(w_high - (0.15 * w_range), 2)
-            levels["week_val"] = round(w_low + (0.15 * w_range), 2)
-            levels["week_poc"] = round((w_high + w_low) / 2.0, 2)
+        prev_candle = candles[-2]
+        levels["pdh"] = float(prev_candle[2])
+        levels["pdl"] = float(prev_candle[3])
+        levels["pdc"] = float(prev_candle[4])
 
-            # Derive Monthly Value Area (last 20 sessions)
-            recent_month = candles[-21:-1] if len(candles) >= 21 else candles[:-1]
-            m_high = max(float(c[2]) for c in recent_month)
-            m_low = min(float(c[3]) for c in recent_month)
-            m_range = m_high - m_low
-            levels["month_vah"] = round(m_high - (0.15 * m_range), 2)
-            levels["month_val"] = round(m_low + (0.15 * m_range), 2)
-            levels["month_poc"] = round((m_high + m_low) / 2.0, 2)
+        recent_week = candles[-6:-1] if len(candles) >= 6 else candles[:-1]
+        prev_week = candles[-11:-6] if len(candles) >= 11 else recent_week
+        recent_month = candles[-21:-1] if len(candles) >= 21 else candles[:-1]
+        prev_month = candles[-42:-21] if len(candles) >= 42 else recent_month
 
-            print(f"[Levels] Real Nifty Levels -> PDH: {levels['pdh']}, PDL: {levels['pdl']}, Week POC: {levels['week_poc']}")
-    except Exception as e:
-        print(f"[Levels Warning] Historical fetch failed: {e}")
+        week = _profile_from_candles(recent_week)
+        pweek = _profile_from_candles(prev_week)
+        month = _profile_from_candles(recent_month)
+        pmonth = _profile_from_candles(prev_month)
+        for prefix, prof in (("week", week), ("prev_week", pweek),
+                             ("month", month), ("prev_month", pmonth)):
+            levels[f"{prefix}_vah"] = prof["vah"]
+            levels[f"{prefix}_val"] = prof["val"]
+            levels[f"{prefix}_poc"] = prof["poc"]
 
-    return levels
+        logger.info("[Levels] Real Nifty Levels -> PDH: %s, PDL: %s, Week POC: %s",
+                    levels["pdh"], levels["pdl"], levels["week_poc"])
+        return levels, True
+    except Exception as exc:
+        logger.error("[Levels] Historical fetch failed: %s", exc)
+        return levels, False
+
+
+def fetch_5m_history(fyers_client):
+    """Seed today's completed 5-minute bars from Fyers history.
+
+    Returns a list of FastBar (possibly empty). An empty list is a
+    safe outcome: the lag engine then returns HOLD until 12 bars have
+    accumulated live.
+    """
+    bars = []
+    try:
+        today = get_ist_now().strftime("%Y-%m-%d")
+        response = fyers_client.history(data={
+            "symbol": "NSE:NIFTY50-INDEX",
+            "resolution": "5",
+            "date_format": "1",
+            "range_from": today,
+            "range_to": today,
+            "cont_flag": "1",
+        })
+        for candle in response.get("candles", []):
+            ts, open_p, high_p, low_p, close_p, volume = candle[:6]
+            ts_str = datetime.fromtimestamp(ts, tz=IST).strftime("%H:%M")
+            bars.append(FastBar(ts_str, float(open_p), float(high_p), float(low_p),
+                                float(close_p), int(volume), BAR_SECONDS))
+        logger.info("Seeded %d completed 5-minute bars from history", len(bars))
+    except Exception as exc:
+        logger.warning("5-minute history seed failed (starting empty): %s", exc)
+    return bars
 
 
 def start_system():
-    print("=" * 60)
-    print(">>> Jev Engine v3.6 (Auction + Footprint + MTF Live) Starting...")
-    print("=" * 60)
+    config = JevConfig.from_env()
+    setup_logging(config.log_level)
+    logger.info("=" * 60)
+    logger.info(">>> Jev Engine (Auction + Footprint + MTF Live) Starting...")
+    logger.info("=" * 60)
+    logger.info("Mode: %s", "Paper Mode" if config.paper_mode else "Live Real Funds")
 
     # 1. Fetch Credentials from Environment Variables / GitHub Secrets
     fyers_client_id = os.environ.get("FYERS_APP_ID", "").strip()
@@ -118,25 +201,27 @@ def start_system():
 
     telegram_bot_token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
     telegram_chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
-    paper_mode_env = os.environ.get("PAPER_MODE", "True").lower() in ("true", "1", "yes")
 
     # 2. Initialize State Store & Execution Router
     state_store = EngineStateStore("engine_state.db")
-    router = ExecutionRouter(fyers_client=None, state_store=state_store, paper_mode=paper_mode_env)
+    router = ExecutionRouter(
+        fyers_client=None, state_store=state_store,
+        paper_mode=config.paper_mode, config=config,
+    )
+    shutdown_event = threading.Event()
 
     # 3. Setup Telegram Controller
     tg = TelegramController(
         bot_token=telegram_bot_token,
         chat_id=telegram_chat_id,
         state_store=state_store,
-        router=router
+        router=router,
     )
-
     if tg.bot:
         tg_thread = threading.Thread(target=tg.run_polling, daemon=True)
         tg_thread.start()
 
-    mode_label = "Paper Mode" if paper_mode_env else "Live Real Funds"
+    mode_label = "Paper Mode" if config.paper_mode else "Live Real Funds"
 
     # 4. Generate/Retrieve Daily Fyers Access Token
     token = os.environ.get("FYERS_ACCESS_TOKEN", "").strip()
@@ -148,44 +233,125 @@ def start_system():
                 redirect_uri="https://trade.fyers.in/api-login/redirect-uri/index.html",
                 fyers_id=fyers_id,
                 pin=fyers_pin,
-                totp_key=fyers_totp_key
+                totp_key=fyers_totp_key,
             )
             token = auth_mgr.get_valid_token()
-            print("[Auth] Fyers access token secured successfully.")
-        except Exception as e:
-            clean_err = sanitize_tg_text(str(e))[:140]
-            print(f"[Auth Error] Failed to generate token: {e}")
+            logger.info("[Auth] Fyers access token secured successfully.")
+        except Exception as exc:
+            clean_err = sanitize_tg_text(str(exc))[:140]
+            logger.error("[Auth Error] Failed to generate token: %s", exc)
             tg.send_alert("Auth Error", f"Token generation failed: {clean_err}")
 
     # 5. Connect Live Stream if Token is Available
     if token:
         fyers = fyersModel.FyersModel(client_id=fyers_client_id, token=token, is_async=False, log_path="")
-        levels = fetch_historical_levels(fyers)
+        # Wire the authenticated client into the router (fix: it used
+        # to stay None forever, making live execution unreachable).
+        router.set_fyers_client(fyers)
+        quote_fn = lambda sym: get_option_quote(fyers, sym)  # noqa: E731
+        router.set_quote_fn(quote_fn)
+
+        levels, levels_ok = fetch_historical_levels(fyers)
+        if not levels_ok:
+            # Never trade on stale hardcoded defaults. Pause and alert.
+            state_store.set_system_flag("SYSTEM_PAUSED", "1")
+            tg.send_alert(
+                "Levels Unavailable -- Trading Paused",
+                "Historical levels could not be fetched from Fyers. "
+                "No trades will be placed on stale defaults.",
+            )
+            logger.error("Historical levels unavailable; trading paused, shutting down")
+            state_store.close()
+            return
         pdh, pdl, pdc = levels["pdh"], levels["pdl"], levels["pdc"]
 
         mtf_builder = None
         if MTF_AVAILABLE:
             mtf_builder = MTFProfileContextBuilder(
-                prev_month=ProfileLevels(levels["month_vah"], levels["month_val"], levels["month_poc"], []),
-                prev_week=ProfileLevels(levels["week_vah"], levels["week_val"], levels["week_poc"], []),
+                prev_month=ProfileLevels(levels["prev_month_vah"], levels["prev_month_val"], levels["prev_month_poc"], []),
+                current_month=ProfileLevels(levels["month_vah"], levels["month_val"], levels["month_poc"], []),
+                prev_week=ProfileLevels(levels["prev_week_vah"], levels["prev_week_val"], levels["prev_week_poc"], []),
                 current_week=ProfileLevels(levels["week_vah"], levels["week_val"], levels["week_poc"], []),
-                daily_profile=ProfileLevels(pdh, pdl, pdc, [])
+                daily_profile=ProfileLevels(pdh, pdl, pdc, []),
             )
 
         tg.send_alert(
             "System Online (Live Feed)",
-            f"Jev Engine v3.6 ({mode_label})\nNifty PDH: {pdh} | PDL: {pdl}\nWeek POC: {levels['week_poc']} | Status: Live Scanning"
+            f"Jev Engine ({mode_label})\nNifty PDH: {pdh} | PDL: {pdl}\n"
+            f"Week POC: {levels['week_poc']} | Status: Live Scanning",
         )
 
         lag_engine = LagNeutralizedEngine(pdh=pdh, pdl=pdl, pdc=pdc)
         fp_engine = AdvancedAuctionFootprintEngine(tick_size=0.05, imbalance_ratio=3.0, stacked_count=3)
+        monitor = PositionMonitor(state_store, router, quote_fn=quote_fn, config=config)
+        expiry = next_weekly_expiry(now=get_ist_now(), override=config.expiry_override)
+        logger.info("Weekly expiry in use: %s", expiry.isoformat())
 
         bar_ticks = []
+        bars_5m_history = fetch_5m_history(fyers)
         bar_start_time = time.time()
         last_heartbeat_time = time.time()
+        last_monitor_time = time.time()
         latest_ltp = pdc
         early_triggered_this_bar = False
-        ws = None
+        ws_holder = {"ws": None}
+        gex_cache = {"value": None, "at": 0.0}
+
+        def get_dealer_net_dex(spot: float):
+            """Cached GEX; None when the chain cannot be fetched (no signal)."""
+            if time.time() - gex_cache["at"] < BAR_SECONDS and gex_cache["at"] != 0.0:
+                return gex_cache["value"]
+            value = compute_dealer_net_dex(fyers, spot, expiry)
+            gex_cache["value"] = value
+            gex_cache["at"] = time.time()
+            if value is None:
+                logger.warning("Dealer gamma unavailable; signals will be HOLD until it is")
+            return value
+
+        def finish_bar(fast_bar: FastBar):
+            nonlocal bar_ticks, bar_start_time, early_triggered_this_bar
+            bars_5m_history.append(fast_bar)
+            if len(bars_5m_history) > 100:
+                del bars_5m_history[:-100]
+            bar_ticks.clear()
+            bar_start_time = time.time()
+            early_triggered_this_bar = False
+
+        def _premium_levels(premium: float):
+            sl = round(premium * SL_FRACTION, 2)
+            t1 = round(premium * T1_FRACTION, 2)
+            t2 = round(premium * T2_FRACTION, 2)
+            return sl, t1, t2
+
+        def _buy_option(option_type: str, fast_bar: FastBar, fp_bar, mtf_context, tag: str):
+            nonlocal early_triggered_this_bar
+            atm_strike = round(fast_bar.close / 50) * 50
+            symbol = option_symbol("NIFTY", expiry, atm_strike, option_type)
+            # Price off the OPTION premium, never the NIFTY spot.
+            premium = get_option_quote(fyers, symbol)
+            if premium is None:
+                logger.error("No option quote for %s; trade skipped", symbol)
+                tg.send_alert("Quote Unavailable", f"No quote for {symbol}; trade skipped.")
+                return
+            sl, t1, t2 = _premium_levels(premium)
+            imb_tag = tag
+            ctx_tag = mtf_context.get("bias", "BREAKOUT")
+            tg.send_alert(
+                f"NIFTY {'BUY' if option_type == 'CE' else 'SELL'} SIGNAL",
+                f"Spot: {fast_bar.close} | {imb_tag}\nContext: {ctx_tag} | "
+                f"Bar Delta: {fp_bar.bar_delta}\nStrike: NIFTY {atm_strike} {option_type} "
+                f"| Premium: {premium} | Expiry: {expiry.isoformat()}",
+            )
+            result = router.execute_buy(
+                symbol=symbol, qty=config.lot_size, ltp=premium, sl=sl, t1=t1, t2=t2,
+            )
+            if result.status == "REJECTED":
+                logger.warning("Buy rejected for %s: %s", symbol, result.reason)
+                tg.send_alert("Order Rejected", f"{symbol}: {sanitize_tg_text(result.reason)}")
+            else:
+                early_triggered_this_bar = True
+                logger.info("Buy %s x%d @ premium %.2f status=%s",
+                            symbol, config.lot_size, premium, result.status)
 
         def evaluate_and_execute(elapsed_sec: int, is_early: bool):
             nonlocal bar_ticks, bar_start_time, early_triggered_this_bar
@@ -199,24 +365,17 @@ def start_system():
 
             fast_bar = FastBar(
                 timestamp=ts_str,
-                open=prices[0],
-                high=max(prices),
-                low=min(prices),
-                close=prices[-1],
-                volume=total_vol,
-                elapsed_seconds=elapsed_sec
+                open=prices[0], high=max(prices), low=min(prices),
+                close=prices[-1], volume=total_vol, elapsed_seconds=elapsed_sec,
             )
-
             fp_bar = fp_engine.evaluate_bar(
-                timestamp=ts_str,
-                open_p=fast_bar.open,
-                high_p=fast_bar.high,
-                low_p=fast_bar.low,
-                close_p=fast_bar.close,
-                volume=total_vol
+                timestamp=ts_str, open_p=fast_bar.open, high_p=fast_bar.high,
+                low_p=fast_bar.low, close_p=fast_bar.close, volume=total_vol,
             )
 
             if state_store.get_system_flag("SYSTEM_PAUSED", "0") == "1":
+                if not is_early:
+                    finish_bar(fast_bar)
                 return
 
             # Check MTF Context & Chop Filter
@@ -224,83 +383,52 @@ def start_system():
             if mtf_builder:
                 mtf_context = mtf_builder.evaluate_auction_context(fast_bar.close, get_ist_now())
                 if mtf_context.get("is_chop_risk"):
-                    print(f"[Veto] Price {fast_bar.close} is inside Weekly POC Chop Zone. Trade skipped.")
+                    logger.info("[Veto] Price %s is inside Weekly POC Chop Zone. Trade skipped.",
+                                fast_bar.close)
                     if not is_early:
-                        bar_ticks.clear()
-                        bar_start_time = time.time()
-                        early_triggered_this_bar = False
+                        finish_bar(fast_bar)
                     return
 
             decision = lag_engine.evaluate_lag_free_execution(
                 current_5m=fast_bar,
-                bars_5m_history=[],
-                dealer_net_dex=125000,
-                cvd_delta=fp_bar.cumulative_delta
+                bars_5m_history=bars_5m_history,
+                dealer_net_dex=get_dealer_net_dex(fast_bar.close),
+                cvd_delta=fp_bar.cumulative_delta,
             )
 
             # Bullish Breakout + Footprint Confirmation
             if decision["signal"] == "EARLY_BUY" and not early_triggered_this_bar:
                 if fp_bar.is_buying_absorption:
-                    print(f"[Veto] Buying Absorption at {fast_bar.high}. Fake breakout blocked.")
+                    logger.info("[Veto] Buying Absorption at %s. Fake breakout blocked.", fast_bar.high)
                 elif fp_engine.is_single_time_framing(3, "DOWN"):
-                    print("[Veto] Active Single Time-Framing DOWN. Counter-buy blocked.")
+                    logger.info("[Veto] Active Single Time-Framing DOWN. Counter-buy blocked.")
                 else:
-                    early_triggered_this_bar = True
-                    atm_strike = round(fast_bar.close / 50) * 50
-                    imb_tag = f"Stacked Buy: {len(fp_bar.stacked_buy_imbalances)} lvls" if fp_bar.stacked_buy_imbalances else "CVD Confirmed"
-                    ctx_tag = mtf_context.get("bias", "BREAKOUT")
-                    tg.send_alert(
-                        "🚀 NIFTY BUY SIGNAL",
-                        f"Spot: {fast_bar.close} | {imb_tag}\nContext: {ctx_tag} | Bar Delta: {fp_bar.bar_delta}\nStrike: NIFTY {atm_strike} CE"
-                    )
-                    router.execute_buy(
-                        symbol=f"NSE:NIFTY26NOV{atm_strike}CE",
-                        qty=75,
-                        ltp=fast_bar.close,
-                        sl=decision["base"],
-                        t1=fast_bar.close + 30,
-                        t2=fast_bar.close + 75
-                    )
+                    imb_tag = (f"Stacked Buy: {len(fp_bar.stacked_buy_imbalances)} lvls"
+                               if fp_bar.stacked_buy_imbalances else "CVD Confirmed")
+                    _buy_option("CE", fast_bar, fp_bar, mtf_context, imb_tag)
 
             # Bearish Breakdown + Footprint Confirmation
             elif decision["signal"] == "EARLY_SELL" and not early_triggered_this_bar:
                 if fp_bar.is_selling_absorption:
-                    print(f"[Veto] Selling Absorption at {fast_bar.low}. Fake breakdown blocked.")
+                    logger.info("[Veto] Selling Absorption at %s. Fake breakdown blocked.", fast_bar.low)
                 elif fp_engine.is_single_time_framing(3, "UP"):
-                    print("[Veto] Active Single Time-Framing UP. Counter-sell blocked.")
+                    logger.info("[Veto] Active Single Time-Framing UP. Counter-sell blocked.")
                 else:
-                    early_triggered_this_bar = True
-                    atm_strike = round(fast_bar.close / 50) * 50
-                    imb_tag = f"Stacked Sell: {len(fp_bar.stacked_sell_imbalances)} lvls" if fp_bar.stacked_sell_imbalances else "CVD Confirmed"
-                    ctx_tag = mtf_context.get("bias", "BREAKDOWN")
-                    tg.send_alert(
-                        "🔻 NIFTY SELL SIGNAL",
-                        f"Spot: {fast_bar.close} | {imb_tag}\nContext: {ctx_tag} | Bar Delta: {fp_bar.bar_delta}\nStrike: NIFTY {atm_strike} PE"
-                    )
-                    router.execute_buy(
-                        symbol=f"NSE:NIFTY26NOV{atm_strike}PE",
-                        qty=75,
-                        ltp=fast_bar.close,
-                        sl=decision["ceiling"],
-                        t1=fast_bar.close - 30,
-                        t2=fast_bar.close - 75
-                    )
+                    imb_tag = (f"Stacked Sell: {len(fp_bar.stacked_sell_imbalances)} lvls"
+                               if fp_bar.stacked_sell_imbalances else "CVD Confirmed")
+                    _buy_option("PE", fast_bar, fp_bar, mtf_context, imb_tag)
 
             if not is_early:
-                bar_ticks.clear()
-                bar_start_time = time.time()
-                early_triggered_this_bar = False
+                finish_bar(fast_bar)
 
         def on_message(message):
-            nonlocal latest_ltp, last_heartbeat_time
+            nonlocal latest_ltp, last_heartbeat_time, last_monitor_time
 
             if not isinstance(message, dict):
                 return
-
             ltp = message.get("ltp")
             if not ltp:
                 return
-
             ltp = float(ltp)
             latest_ltp = ltp
             qty = int(message.get("last_traded_qty", 1))
@@ -313,45 +441,82 @@ def start_system():
             now_ts = time.time()
             elapsed = int(now_ts - bar_start_time)
 
+            # Exit management: re-price open positions about once a minute.
+            if (now_ts - last_monitor_time) >= MONITOR_CHECK_SECONDS:
+                last_monitor_time = now_ts
+                for action in monitor.check_positions():
+                    tg.send_alert("Position Update", sanitize_tg_text(action))
+
             # 30-Minute Live Heartbeat Telemetry
             if (now_ts - last_heartbeat_time) >= 1800:
                 last_heartbeat_time = now_ts
                 tg.send_alert(
-                    "💓 Engine Heartbeat",
-                    f"Nifty Spot: {latest_ltp}\nRunning CVD: {fp_engine.running_cvd}\nStatus: Active & Scanning"
+                    "Engine Heartbeat",
+                    f"Nifty Spot: {latest_ltp}\nRunning CVD: {fp_engine.running_cvd}\n"
+                    f"Status: Active & Scanning",
                 )
 
-            if elapsed >= 300:
+            if elapsed >= BAR_SECONDS:
                 evaluate_and_execute(elapsed, is_early=False)
-            elif elapsed >= 260 and not early_triggered_this_bar:
+            elif elapsed >= EARLY_TRIGGER_SECONDS and not early_triggered_this_bar:
                 evaluate_and_execute(elapsed, is_early=True)
 
         def on_error(msg):
-            print(f"[WS Error] {msg}")
+            logger.error("[WS Error] %s", msg)
 
         def on_close(msg):
-            print(f"[WS Closed] {msg}")
+            logger.info("[WS Closed] %s", msg)
 
         def on_open():
-            print("[WS Connected] Subscribing to NSE:NIFTY50-INDEX...")
-            ws.subscribe(symbols=["NSE:NIFTY50-INDEX"], data_type="symbolUpdate")
-            ws.keep_running()
+            logger.info("[WS Connected] Subscribing to NSE:NIFTY50-INDEX...")
+            ws = ws_holder["ws"]
+            if ws is not None:
+                ws.subscribe(symbols=["NSE:NIFTY50-INDEX"], data_type="symbolUpdate")
+                ws.keep_running()
 
-        # Market Close Watcher Thread (Auto-stops cleanly at 3:31 PM IST)
+        def _parse_hhmm(value: str):
+            hour, minute = value.split(":")
+            return int(hour), int(minute)
+
+        # Market Close Watcher: square off, then shut down gracefully.
         def market_close_watcher():
-            while True:
+            sq_hour, sq_min = _parse_hhmm(config.square_off_time)
+            cl_hour, cl_min = _parse_hhmm(config.market_close_time)
+            squared_off = False
+            while not shutdown_event.is_set():
                 now_ist = get_ist_now()
-                if now_ist.hour > 15 or (now_ist.hour == 15 and now_ist.minute >= 31):
+                if not squared_off and (now_ist.hour, now_ist.minute) >= (sq_hour, sq_min):
+                    squared_off = True
+                    actions = monitor.square_off_all()
+                    tg.send_alert(
+                        "End-of-Day Square-Off",
+                        "All open positions closed at market.\n" + "\n".join(actions)
+                        if actions else "No open positions to square off.",
+                    )
+                    logger.info("End-of-day square-off done: %s", actions)
+                if (now_ist.hour, now_ist.minute) >= (cl_hour, cl_min):
                     tg.send_alert(
                         "Session Closed",
-                        f"Market closed at 3:30 PM IST.\nFinal Nifty Spot: {latest_ltp} | Session CVD: {fp_engine.running_cvd}"
+                        f"Market closed at 3:30 PM IST.\nFinal Nifty Spot: {latest_ltp} | "
+                        f"Session CVD: {fp_engine.running_cvd}",
                     )
-                    os._exit(0)
-                time.sleep(30)
+                    shutdown_event.set()
+                    break
+                shutdown_event.wait(30)
+            # Graceful shutdown: ask the socket to close, then the
+            # main thread closes the state store below.
+            ws = ws_holder["ws"]
+            if ws is not None:
+                close_fn = getattr(ws, "close", None)
+                if callable(close_fn):
+                    try:
+                        close_fn()
+                    except Exception as exc:
+                        logger.warning("WebSocket close failed: %s", exc)
 
         threading.Thread(target=market_close_watcher, daemon=True).start()
 
-        print("[Streaming] Connecting to live Fyers WebSocket feed...")
+        logger.info("[Streaming] Connecting to live Fyers WebSocket feed...")
         full_token = f"{fyers_client_id}:{token}"
         ws = data_ws.FyersDataSocket(
             access_token=full_token,
@@ -361,50 +526,40 @@ def start_system():
             on_connect=on_open,
             on_close=on_close,
             on_error=on_error,
-            on_message=on_message
+            on_message=on_message,
         )
-        ws.connect()
+        ws_holder["ws"] = ws
+        try:
+            ws.connect()
+        finally:
+            # Graceful shutdown: flush/close the DB instead of os._exit(0).
+            shutdown_event.set()
+            state_store.close()
+            logger.info(">>> Jev Engine lifecycle finished.")
 
     else:
-        # Fallback Batch Loop if token is unavailable
-        tg.send_alert("System Online (Fallback)", f"Jev Engine v3.6 Started in {mode_label} (No Live Token).")
-        print("[Fallback/Paper] Running simulated telemetry baseline...")
-        fallback_engine = LagNeutralizedEngine(pdh=23250.0, pdl=23050.0, pdc=23140.0)
+        # No live token: do NOT trade. The old fallback loop ran mock
+        # bars and could send genuine-looking Telegram "Signal Triggered"
+        # alerts and paper trades from fake data. Now it only waits,
+        # alerting once that the engine is idle.
+        tg.send_alert(
+            "System Online (No Live Token)",
+            f"Jev Engine started in {mode_label} with no Fyers token. "
+            "Engine is idle: no signals, no trades.",
+        )
+        logger.warning("[Fallback] No live token; engine idle (no mock trading)")
         try:
-            iteration = 0
             max_iterations = int(os.environ.get("MAX_ITERATIONS", "10"))
-
-            while iteration < max_iterations:
-                if state_store.get_system_flag("SYSTEM_PAUSED", "0") == "1":
-                    time.sleep(2)
-                    continue
-
-                mock_bar = FastBar("14:24", 23210, 23265, 23205, 23262, 45000, 270)
-                decision = fallback_engine.evaluate_lag_free_execution(
-                    mock_bar, [], dealer_net_dex=125000, cvd_delta=4500
-                )
-
-                if decision["signal"] == "EARLY_BUY":
-                    tg.send_alert("Signal Triggered", f"EARLY BUY at {decision['trigger_price']} | 30M Ceiling Breakout")
-                    res = router.execute_buy(
-                        symbol="NSE:NIFTY26NOV23250CE",
-                        qty=75,
-                        ltp=4.50,
-                        sl=2.25,
-                        t1=15.0,
-                        t2=45.0
-                    )
-                    print(f"[Execution Result] {res}")
-
-                iteration += 1
+            for _ in range(max_iterations):
+                if shutdown_event.is_set():
+                    break
                 time.sleep(1)
-
         except KeyboardInterrupt:
             tg.send_alert("System Shutdown", "Jev Engine manually terminated.")
-
-    print(">>> Jev Engine lifecycle finished.")
+        finally:
+            state_store.close()
+            logger.info(">>> Jev Engine lifecycle finished.")
 
 
 if __name__ == "__main__":
     start_system()
-    
