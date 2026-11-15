@@ -4,7 +4,7 @@ Sliding Rolling Window and Sub-bar (260-sec) Early Execution Engine.
 """
 
 from dataclasses import dataclass
-from typing import List, Dict
+from typing import Dict, List, Optional
 
 
 @dataclass
@@ -27,7 +27,14 @@ class LagNeutralizedEngine:
     def get_layer1_bias(self, current_price: float) -> str:
         return "BULLISH" if current_price >= self.pdc else "BEARISH"
 
-    def get_layer2_synthetic_trend(self, bars_5m: List[FastBar], dealer_net_dex: float) -> str:
+    def get_layer2_synthetic_trend(
+        self, bars_5m: List[FastBar], dealer_net_dex: Optional[float]
+    ) -> str:
+        # Unknown dealer exposure (e.g. the option chain could not be
+        # fetched) is NEUTRAL: it must never be replaced by a constant,
+        # and it must never produce a signal.
+        if dealer_net_dex is None:
+            return "NEUTRAL"
         if len(bars_5m) < 12:
             return "NEUTRAL"
 
@@ -52,7 +59,7 @@ class LagNeutralizedEngine:
         self,
         current_5m: FastBar,
         bars_5m_history: List[FastBar],
-        dealer_net_dex: float,
+        dealer_net_dex: Optional[float],
         cvd_delta: float
     ) -> Dict[str, any]:
         daily_bias = self.get_layer1_bias(current_5m.close)
