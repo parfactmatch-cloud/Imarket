@@ -28,9 +28,15 @@ class MTFProfileContextBuilder:
         prev_month: ProfileLevels,
         prev_week: ProfileLevels,
         current_week: ProfileLevels,
-        daily_profile: ProfileLevels
+        daily_profile: ProfileLevels,
+        current_month: Optional[ProfileLevels] = None,
     ):
         self.prev_month = prev_month
+        # current_month defaults to prev_month for callers that only have
+        # one month of levels; when supplied, the day-of-month rule below
+        # actually selects between the two (the old code returned
+        # prev_month from both branches).
+        self.current_month = current_month if current_month is not None else prev_month
         self.prev_week = prev_week
         self.current_week = current_week
         self.daily_profile = daily_profile
@@ -50,11 +56,15 @@ class MTFProfileContextBuilder:
             weekly_label = "CURRENT_WEEK_DEVELOPING"
 
         use_prior_month = dt.day <= 7
-        active_monthly = self.prev_month if use_prior_month else self.prev_month
+        # Fixed: the old code returned self.prev_month from BOTH branches,
+        # so the current month was never used.
+        active_monthly = self.prev_month if use_prior_month else self.current_month
+        monthly_label = "PRIOR_MONTH" if use_prior_month else "CURRENT_MONTH"
 
         return {
             "weekly_label": weekly_label,
             "weekly_levels": active_weekly,
+            "monthly_label": monthly_label,
             "monthly_levels": active_monthly,
             "daily_levels": self.daily_profile
         }
