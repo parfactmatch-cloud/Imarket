@@ -1,6 +1,11 @@
 """
 time_price_multi_layer_engine.py
 Top-Down Multi-Timeframe (1D -> 2H -> 30M -> 15M -> 5M) Execution Engine.
+
+NOTE: NOT wired into the live path. The orchestrator's live signal
+comes from LagNeutralizedEngine + AdvancedAuctionFootprintEngine.
+Kept as a standalone library module; see README "What is not in the
+live path".
 """
 
 from dataclasses import dataclass
