@@ -2,12 +2,20 @@
 fyers_live_feed.py
 Real-Time WebSocket Feed Handler using Fyers Data Socket (v3).
 Pipes live ticks directly into Order Flow and Lag-Neutralized Engine.
+
+NOTE: this streamer is NOT used by the live path. main_jev_orchestrator
+re-implements streaming inline (it subscribes to NIFTY spot only, while
+this module also subscribes to BANKNIFTY). Kept as a standalone
+reference implementation; see README "What is not in the live path".
 """
 
+import logging
 import time
 from fyers_apiv3.FyersWebsocket import data_ws
 from india_order_flow_engine import IndiaOrderFlowEngine, TickData
 from lag_neutralized_engine import FastBar
+
+logger = logging.getLogger(__name__)
 
 
 class FyersLiveStreamer:
@@ -92,13 +100,13 @@ class FyersLiveStreamer:
             self.bar_start_time = time.time()
 
     def on_error(self, message):
-        print(f"[WebSocket Error] {message}")
+        logger.error("[WebSocket Error] %s", message)
 
     def on_close(self, message):
-        print(f"[WebSocket Closed] {message}")
+        logger.info("[WebSocket Closed] %s", message)
 
     def on_open(self):
-        print("[WebSocket Connected] Subscribing to Nifty Index & Key Options...")
+        logger.info("[WebSocket Connected] Subscribing to Nifty Index & Key Options...")
         # Symbols to track: Nifty Spot and nearest weekly contracts
         symbols = [
             "NSE:NIFTY50-INDEX",
