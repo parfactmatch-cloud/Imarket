@@ -3,8 +3,12 @@ telegram_remote_controller.py
 Sub-second Telegram Bot Interface for Remote Engine Monitoring and Kill-Switch.
 """
 
+import logging
+
 from engine_state_store import EngineStateStore
 from execution_broker_interface import ExecutionRouter
+
+logger = logging.getLogger(__name__)
 
 
 class TelegramController:
@@ -21,7 +25,7 @@ class TelegramController:
                 self.bot = telebot.TeleBot(bot_token)
                 self._register_handlers()
             except ImportError:
-                print("[TelegramController] pyTelegramBotAPI not installed. Telegram disabled.")
+                logger.warning("[TelegramController] pyTelegramBotAPI not installed. Telegram disabled.")
 
     def _register_handlers(self):
         @self.bot.message_handler(commands=['status'])
@@ -73,9 +77,9 @@ class TelegramController:
                 msg = f"🔔 *{title}*\n{details}"
                 self.bot.send_message(self.chat_id, msg, parse_mode="Markdown")
             except Exception as e:
-                print(f"[Telegram Error] {e}")
+                logger.warning("[Telegram Error] %s", e)
         else:
-            print(f"[ALERT: {title}] {details}")
+            logger.info("[ALERT: %s] %s", title, details)
 
     def run_polling(self):
         if self.bot:
