@@ -51,7 +51,7 @@ from expiry import next_weekly_expiry, option_symbol
 from fyers_auth_automation import FyersAuthManager
 from lag_neutralized_engine import LagNeutralizedEngine, FastBar
 from advanced_auction_footprint_engine import AdvancedAuctionFootprintEngine
-from market_data import compute_dealer_net_dex, get_option_quote
+from market_data import compute_gex_snapshot, get_option_quote
 from position_monitor import PositionMonitor
 from telegram_remote_controller import TelegramController
 
@@ -76,18 +76,32 @@ def sanitize_tg_text(text: str) -> str:
     return str(text).replace("_", " ").replace("*", "").replace("`", "")
 
 
+def _fmt_level(value) -> str:
+    """Format a price level for Telegram: whole strikes as ints, else 2dp."""
+    if value is None:
+        return "n/a"
+    value = float(value)
+    return f"{value:.0f}" if value == int(value) else f"{value:.2f}"
+
+
 def _signal_alert_details(*, spot, imb_tag, ctx_tag, bar_delta, strike,
-                          option_type, premium, expiry, sl, t1, t2, qty):
+                          option_type, premium, expiry, sl, t1, t2, qty,
+                          call_wall=None, put_wall=None, week_poc=None):
     """Details text for the NIFTY BUY/SELL SIGNAL Telegram alert.
 
     Includes the stop-loss and targets, not just the premium, so the
-    risk on the trade is visible in the message itself.
+    risk on the trade is visible in the message itself, plus the call
+    wall, put wall and weekly POC the engine checked before signalling
+    -- so the levels can be cross-checked against the live chain.
+    Missing values print as "n/a" rather than being guessed.
     """
     return (
         f"Spot: {spot} | {imb_tag}\nContext: {ctx_tag} | "
         f"Bar Delta: {bar_delta}\nStrike: NIFTY {strike} {option_type} "
         f"| Premium: {premium} | Expiry: {expiry.isoformat()}\n"
-        f"SL: {sl} | T1: {t1} | T2: {t2} | Qty: {qty}"
+        f"SL: {sl} | T1: {t1} | T2: {t2} | Qty: {qty}\n"
+        f"Walls: C {_fmt_level(call_wall)} / P {_fmt_level(put_wall)} "
+        f"| Week POC: {_fmt_level(week_poc)}"
     )
 
 
@@ -310,18 +324,23 @@ def start_system():
         latest_ltp = pdc
         early_triggered_this_bar = False
         ws_holder = {"ws": None}
-        gex_cache = {"value": None, "at": 0.0}
+        gex_cache = {"value": None, "at": 0.0}  # caches the GEXSnapshot
 
-        def get_dealer_net_dex(spot: float):
-            """Cached GEX; None when the chain cannot be fetched (no signal)."""
+        def get_gex_snapshot(spot: float):
+            """Cached GEX snapshot; None when the chain cannot be fetched."""
             if time.time() - gex_cache["at"] < BAR_SECONDS and gex_cache["at"] != 0.0:
                 return gex_cache["value"]
-            value = compute_dealer_net_dex(fyers, spot, expiry)
+            value = compute_gex_snapshot(fyers, spot, expiry)
             gex_cache["value"] = value
             gex_cache["at"] = time.time()
             if value is None:
                 logger.warning("Dealer gamma unavailable; signals will be HOLD until it is")
             return value
+
+        def get_dealer_net_dex(spot: float):
+            """Cached GEX; None when the chain cannot be fetched (no signal)."""
+            snapshot = get_gex_snapshot(spot)
+            return float(snapshot.net_gex) if snapshot is not None else None
 
         def finish_bar(fast_bar: FastBar):
             nonlocal bar_ticks, bar_start_time, early_triggered_this_bar
@@ -351,6 +370,9 @@ def start_system():
             sl, t1, t2 = _premium_levels(premium)
             imb_tag = tag
             ctx_tag = mtf_context.get("bias", "BREAKOUT")
+            # Same cached snapshot the signal decision used, so the walls
+            # printed are the walls the trade was judged against.
+            snapshot = get_gex_snapshot(fast_bar.close)
             tg.send_alert(
                 f"NIFTY {'BUY' if option_type == 'CE' else 'SELL'} SIGNAL",
                 _signal_alert_details(
@@ -359,6 +381,9 @@ def start_system():
                     option_type=option_type, premium=premium,
                     expiry=expiry, sl=sl, t1=t1, t2=t2,
                     qty=config.lot_size,
+                    call_wall=snapshot.call_wall if snapshot else None,
+                    put_wall=snapshot.put_wall if snapshot else None,
+                    week_poc=mtf_context.get("poc"),
                 ),
             )
             result = router.execute_buy(
