@@ -444,3 +444,41 @@ def test_auth_raise_if_error_names_the_rejected_step():
     page = _FakePage("Incorrect PIN. Please try again.")
     with pytest.raises(RuntimeError, match="PIN step failed"):
         _raise_if_error(page, "PIN step")
+
+
+# ---------------------------------------------------------------- _first_visible / selector regression
+class _FakeLocator:
+    def __init__(self, count=0):
+        self._count = count
+
+    def count(self):
+        return self._count
+
+
+class _FakePageForSelectors:
+    def __init__(self, counts):
+        self._counts = counts
+
+    def locator(self, selector):
+        if selector not in self._counts:
+            raise RuntimeError(f"bad selector: {selector}")
+        return _FakeLocator(self._counts[selector])
+
+
+def test_first_visible_skips_bad_selector():
+    from fyers_auth_automation import _first_visible
+
+    page = _FakePageForSelectors({"button:has-text('Client ID'):visible": 0, "text='Client ID'": 1})
+    assert _first_visible(page, ("button:has-text('Client ID'):visible", "text='Client ID'")) is not None
+    assert _first_visible(page, ("button:has-text('Client ID'):visible",)) is None
+
+
+def test_no_role_attribute_selector():
+    # Regression for run #42 (16 Nov 2026): "[role='tab']" inside a
+    # comma-combined selector made Playwright reject the whole locator
+    # with "Unexpected token '='".
+    import fyers_auth_automation as auth
+
+    for selectors in (auth._TAB_SELECTORS, auth._CLIENT_ID_INPUT_SELECTORS):
+        for selector in selectors:
+            assert "[role=" not in selector, selector
