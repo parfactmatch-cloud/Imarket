@@ -76,6 +76,21 @@ def sanitize_tg_text(text: str) -> str:
     return str(text).replace("_", " ").replace("*", "").replace("`", "")
 
 
+def _signal_alert_details(*, spot, imb_tag, ctx_tag, bar_delta, strike,
+                          option_type, premium, expiry, sl, t1, t2, qty):
+    """Details text for the NIFTY BUY/SELL SIGNAL Telegram alert.
+
+    Includes the stop-loss and targets, not just the premium, so the
+    risk on the trade is visible in the message itself.
+    """
+    return (
+        f"Spot: {spot} | {imb_tag}\nContext: {ctx_tag} | "
+        f"Bar Delta: {bar_delta}\nStrike: NIFTY {strike} {option_type} "
+        f"| Premium: {premium} | Expiry: {expiry.isoformat()}\n"
+        f"SL: {sl} | T1: {t1} | T2: {t2} | Qty: {qty}"
+    )
+
+
 def _profile_from_candles(candles):
     """Crude value-area proxy from a candle window (see README limits).
 
@@ -338,9 +353,13 @@ def start_system():
             ctx_tag = mtf_context.get("bias", "BREAKOUT")
             tg.send_alert(
                 f"NIFTY {'BUY' if option_type == 'CE' else 'SELL'} SIGNAL",
-                f"Spot: {fast_bar.close} | {imb_tag}\nContext: {ctx_tag} | "
-                f"Bar Delta: {fp_bar.bar_delta}\nStrike: NIFTY {atm_strike} {option_type} "
-                f"| Premium: {premium} | Expiry: {expiry.isoformat()}",
+                _signal_alert_details(
+                    spot=fast_bar.close, imb_tag=imb_tag, ctx_tag=ctx_tag,
+                    bar_delta=fp_bar.bar_delta, strike=atm_strike,
+                    option_type=option_type, premium=premium,
+                    expiry=expiry, sl=sl, t1=t1, t2=t2,
+                    qty=config.lot_size,
+                ),
             )
             result = router.execute_buy(
                 symbol=symbol, qty=config.lot_size, ltp=premium, sl=sl, t1=t1, t2=t2,
