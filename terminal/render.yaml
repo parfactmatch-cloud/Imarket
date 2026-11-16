@@ -1,0 +1,15 @@
+# Render deploy for Jev Terminal (free tier works).
+# In Render: New + -> Web Service -> pick the Imarket repo ->
+# Root Directory: terminal, Build Command: (none — stdlib only),
+# Start Command: python server.py. Render sets $PORT automatically.
+# Data (snapshots, plans, logged levels) is stored in terminal/data
+# on the service's disk; on the free tier that disk is ephemeral,
+# so re-log the engine levels after a redeploy, or attach a disk.
+services:
+  - type: web
+    name: jev-terminal
+    env: python
+    rootDir: terminal
+    buildCommand: ""
+    startCommand: python server.py
+    healthCheckPath: /api/health

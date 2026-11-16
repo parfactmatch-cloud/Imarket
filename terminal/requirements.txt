@@ -1,0 +1,2 @@
+# Jev Terminal has no dependencies — Python 3.10+ standard library only.
+# (This file exists so hosts that expect a requirements.txt find one.)
