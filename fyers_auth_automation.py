@@ -142,6 +142,24 @@ def _first_visible(page, selectors):
     return None
 
 
+def _wait_for_enabled(locator, timeout_ms: int = 5000, poll_ms: int = 250) -> bool:
+    """Poll until the locator's element is enabled. Fyers validates the
+    Client ID as you type (possibly with an async check), so the button
+    can still be disabled right after typing even for a good ID."""
+    deadline = time.time() + timeout_ms / 1000.0
+    while time.time() < deadline:
+        try:
+            if not locator.is_disabled():
+                return True
+        except Exception:
+            return False
+        time.sleep(poll_ms / 1000.0)
+    try:
+        return not locator.is_disabled()
+    except Exception:
+        return False
+
+
 class FyersAuthManager:
     def __init__(self, client_id: str, secret_key: str, redirect_uri: str, fyers_id: str, pin: str, totp_key: str):
         self.client_id = client_id.strip() if client_id else ""
@@ -270,6 +288,17 @@ class FyersAuthManager:
             except Exception:
                 typed_len = -1
             logger.info("[Auth] Client ID field length after typing: %s", typed_len)
+            # What format does Fyers expect? Log the field's own hints
+            # (maxlength / pattern / placeholder). These are page chrome,
+            # not the entered value.
+            try:
+                field_attrs = {
+                    name: client_id_input.get_attribute(name)
+                    for name in ("maxlength", "pattern", "placeholder", "inputmode")
+                }
+            except Exception:
+                field_attrs = {}
+            logger.info("[Auth] Client ID field attrs: %s", field_attrs)
 
             submit_btn = page.locator("#clientIdSubmit:visible, button:has-text('Continue'):visible").first
             try:
@@ -281,13 +310,23 @@ class FyersAuthManager:
             except Exception:
                 submit_desc = "unreadable"
             logger.info("[Auth] Client ID submit button: %s", submit_desc)
-            if submit_btn.is_disabled():
+            # Blur the field (some pages validate on blur) and give Fyers
+            # a few seconds to enable Continue: run #45 showed it still
+            # disabled 500ms after typing, which may just be an async
+            # check still in flight rather than a rejected ID.
+            try:
+                client_id_input.press("Tab")
+            except Exception:
+                pass
+            enabled = _wait_for_enabled(submit_btn, timeout_ms=5000)
+            logger.info("[Auth] Client ID submit button enabled after wait: %s", enabled)
+            if not enabled:
                 browser.close()
                 raise RuntimeError(
                     "Client ID Continue button is disabled after typing "
-                    f"(field length {typed_len}): Fyers did not accept the "
-                    "entered ID, or the field did not register the typing | "
-                    f"{_screen_summary(page)}"
+                    f"(field length {typed_len}) and 5s wait: Fyers did not "
+                    "accept the entered ID, or the field did not register "
+                    f"the typing | {_screen_summary(page)}"
                 )
             submit_btn.click()
             logger.info("[Auth] Client ID submitted, waiting for OTP screen")

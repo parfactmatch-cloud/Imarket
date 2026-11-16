@@ -498,3 +498,27 @@ def test_safe_url_redacts_client_id():
     assert "response_type=code" in safe
     summary = _screen_summary(_FakePage("Login to FYERS Mobile number", url=url))
     assert "MYAPP-100" not in summary
+
+
+def test_wait_for_enabled_polls_until_enabled():
+    from fyers_auth_automation import _wait_for_enabled
+
+    class _FlippingButton:
+        def __init__(self):
+            self.calls = 0
+
+        def is_disabled(self):
+            self.calls += 1
+            return self.calls < 3
+
+    assert _wait_for_enabled(_FlippingButton(), timeout_ms=5000, poll_ms=1) is True
+
+
+def test_wait_for_enabled_false_when_never_enabled():
+    from fyers_auth_automation import _wait_for_enabled
+
+    class _StuckButton:
+        def is_disabled(self):
+            return True
+
+    assert _wait_for_enabled(_StuckButton(), timeout_ms=50, poll_ms=10) is False
