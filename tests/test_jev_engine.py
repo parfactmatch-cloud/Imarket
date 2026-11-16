@@ -482,3 +482,19 @@ def test_no_role_attribute_selector():
     for selectors in (auth._TAB_SELECTORS, auth._CLIENT_ID_INPUT_SELECTORS):
         for selector in selectors:
             assert "[role=" not in selector, selector
+
+
+def test_safe_url_redacts_client_id():
+    from fyers_auth_automation import _safe_url, _screen_summary
+
+    url = (
+        "https://api-t1.fyers.in/api/v3/generate-authcode"
+        "?client_id=MYAPP-100&redirect_uri=https%3A%2F%2Ftrade.fyers.in%2F"
+        "api-login%2Fredirect-uri%2Findex.html&response_type=code&state=sample_state"
+    )
+    safe = _safe_url(url)
+    assert "MYAPP-100" not in safe
+    assert "client_id=%2A%2A%2A" in safe or "client_id=***" in safe
+    assert "response_type=code" in safe
+    summary = _screen_summary(_FakePage("Login to FYERS Mobile number", url=url))
+    assert "MYAPP-100" not in summary
