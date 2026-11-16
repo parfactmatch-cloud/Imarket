@@ -396,105 +396,109 @@ def test_historical_levels_failure_is_not_ok(monkeypatch):
     assert levels["pdc"] == 23900.0
 
 
-# ---------------------------------------------------------------- Fyers auth diagnostics
-class _FakePage:
-    def __init__(self, text, url="https://api-t1.fyers.in/api/v3/generate-authcode"):
-        self._text = text
-        self.url = url
+# ---------------------------------------------------------------- Fyers API login (no browser)
+class _FakeResponse:
+    def __init__(self, status_code, body):
+        self.status_code = status_code
+        self._body = body
+        self.text = json.dumps(body) if isinstance(body, dict) else str(body)
 
-    def inner_text(self, _selector):
-        return self._text
-
-
-def test_auth_error_phrase_is_found():
-    from fyers_auth_automation import _find_error_text
-
-    assert _find_error_text("Login to FYERS Invalid OTP. Please try again.") is not None
-    assert "Invalid OTP" in _find_error_text("Login to FYERS Invalid OTP. Please try again.")
-    assert _find_error_text("Login to FYERS Mobile number Client ID +91 Continue") is None
+    def json(self):
+        if not isinstance(self._body, dict):
+            raise ValueError("not JSON")
+        return self._body
 
 
-def test_auth_screen_summary_includes_url_and_text():
-    from fyers_auth_automation import _screen_summary
+def _api_login_posts(monkeypatch, fail_at=None):
+    """Fake requests.post for the vagator + token + validate flow.
 
-    summary = _screen_summary(_FakePage("Login to FYERS\nMobile number"))
-    assert "api-t1.fyers.in" in summary
-    assert "Login to FYERS" in summary
-    assert "Mobile number" in summary
+    fail_at names a step to fail ("otp", "totp", "pin", "token") with
+    HTTP 400 and a Fyers-style message.
+    """
+    calls = []
 
+    def fake_post(url, json=None, headers=None, timeout=None, allow_redirects=True):
+        calls.append(url)
+        if "send_login_otp" in url:
+            if fail_at == "otp":
+                return _FakeResponse(400, {"s": "error", "message": "Invalid FY ID"})
+            return _FakeResponse(200, {"request_key": "rk1"})
+        if "verify_otp" in url:
+            if fail_at == "totp":
+                return _FakeResponse(400, {"s": "error", "message": "Invalid OTP"})
+            return _FakeResponse(200, {"request_key": "rk2"})
+        if "verify_pin" in url:
+            if fail_at == "pin":
+                return _FakeResponse(400, {"s": "error", "message": "Invalid PIN"})
+            return _FakeResponse(200, {"data": {"access_token": "trade-token"}})
+        if url.endswith("/api/v3/token"):
+            if fail_at == "token":
+                return _FakeResponse(400, {"s": "error", "message": "Token failed"})
+            return _FakeResponse(308, {"Url": "https://trade.fyers.in/api-login/redirect-uri/index.html?auth_code=AUTH123&state=sample_state"})
+        if "validate-authcode" in url:
+            return _FakeResponse(200, {"access_token": "api-token"})
+        raise AssertionError(f"unexpected URL {url}")
 
-def test_auth_wait_for_text_raises_naming_the_stuck_step():
-    from fyers_auth_automation import _wait_for_text
-
-    page = _FakePage("Learn more Login to FYERS Mobile number Client ID +91 Continue")
-    with pytest.raises(RuntimeError, match="Client ID step did not advance"):
-        _wait_for_text(page, r"TOTP|OTP", "Client ID step", timeout_ms=100)
-
-
-def test_auth_wait_for_text_returns_when_otp_screen_appears():
-    from fyers_auth_automation import _wait_for_text
-
-    page = _FakePage("Enter your TOTP to continue")
-    assert "TOTP" in _wait_for_text(page, r"TOTP|OTP", "Client ID step", timeout_ms=100)
-
-
-def test_auth_raise_if_error_names_the_rejected_step():
-    from fyers_auth_automation import _raise_if_error
-
-    page = _FakePage("Incorrect PIN. Please try again.")
-    with pytest.raises(RuntimeError, match="PIN step failed"):
-        _raise_if_error(page, "PIN step")
-
-
-# ---------------------------------------------------------------- _first_visible / selector regression
-class _FakeLocator:
-    def __init__(self, count=0):
-        self._count = count
-
-    def count(self):
-        return self._count
+    monkeypatch.setattr("fyers_auth_automation.requests.post", fake_post)
+    return calls
 
 
-class _FakePageForSelectors:
-    def __init__(self, counts):
-        self._counts = counts
+def _api_auth_manager(tmp_path):
+    from fyers_auth_automation import FyersAuthManager
 
-    def locator(self, selector):
-        if selector not in self._counts:
-            raise RuntimeError(f"bad selector: {selector}")
-        return _FakeLocator(self._counts[selector])
-
-
-def test_first_visible_skips_bad_selector():
-    from fyers_auth_automation import _first_visible
-
-    page = _FakePageForSelectors({"button:has-text('Client ID'):visible": 0, "text='Client ID'": 1})
-    assert _first_visible(page, ("button:has-text('Client ID'):visible", "text='Client ID'")) is not None
-    assert _first_visible(page, ("button:has-text('Client ID'):visible",)) is None
+    mgr = FyersAuthManager("APP123-100", "secret", "https://trade.fyers.in/api-login/redirect-uri/index.html",
+                           "AB12345", "1234", "JBSWY3DPEHPK3PXP")
+    mgr.token_file = str(tmp_path / "fyers_access_token.json")
+    return mgr
 
 
-def test_no_role_attribute_selector():
-    # Regression for run #42 (16 Nov 2026): "[role='tab']" inside a
-    # comma-combined selector made Playwright reject the whole locator
-    # with "Unexpected token '='".
-    import fyers_auth_automation as auth
+def test_api_login_happy_path(tmp_path, monkeypatch):
+    calls = _api_login_posts(monkeypatch)
+    mgr = _api_auth_manager(tmp_path)
+    assert mgr.generate_token() == "api-token"
+    assert any("send_login_otp" in url for url in calls)
+    assert any("verify_otp" in url for url in calls)
+    assert any("verify_pin" in url for url in calls)
+    assert any(url.endswith("/api/v3/token") for url in calls)
+    assert any("validate-authcode" in url for url in calls)
+    assert json.loads((tmp_path / "fyers_access_token.json").read_text())["access_token"] == "api-token"
 
-    for selectors in (auth._TAB_SELECTORS, auth._CLIENT_ID_INPUT_SELECTORS):
-        for selector in selectors:
-            assert "[role=" not in selector, selector
+
+def test_api_login_otp_step_names_itself(tmp_path, monkeypatch):
+    _api_login_posts(monkeypatch, fail_at="otp")
+    with pytest.raises(RuntimeError, match="Login OTP step"):
+        _api_auth_manager(tmp_path).generate_token()
 
 
-def test_safe_url_redacts_client_id():
-    from fyers_auth_automation import _safe_url, _screen_summary
+def test_api_login_totp_step_names_itself(tmp_path, monkeypatch):
+    _api_login_posts(monkeypatch, fail_at="totp")
+    with pytest.raises(RuntimeError, match="TOTP step"):
+        _api_auth_manager(tmp_path).generate_token()
 
-    url = (
-        "https://api-t1.fyers.in/api/v3/generate-authcode"
-        "?client_id=MYAPP-100&redirect_uri=https%3A%2F%2Ftrade.fyers.in%2F"
-        "api-login%2Fredirect-uri%2Findex.html&response_type=code&state=sample_state"
-    )
-    safe = _safe_url(url)
-    assert "MYAPP-100" not in safe
-    assert "client_id=%2A%2A%2A" in safe or "client_id=***" in safe
-    assert "response_type=code" in safe
-    summary = _screen_summary(_FakePage("Login to FYERS Mobile number", url=url))
-    assert "MYAPP-100" not in summary
+
+def test_api_login_pin_step_names_itself(tmp_path, monkeypatch):
+    _api_login_posts(monkeypatch, fail_at="pin")
+    with pytest.raises(RuntimeError, match="PIN step"):
+        _api_auth_manager(tmp_path).generate_token()
+
+
+def test_api_login_token_step_names_itself(tmp_path, monkeypatch):
+    _api_login_posts(monkeypatch, fail_at="token")
+    with pytest.raises(RuntimeError, match="Auth code step"):
+        _api_auth_manager(tmp_path).generate_token()
+
+
+def test_split_client_id():
+    from fyers_auth_automation import _split_client_id
+
+    assert _split_client_id("ABC123XYZ-100") == ("ABC123XYZ", "100")
+    assert _split_client_id("ABC123XYZ-200") == ("ABC123XYZ", "200")
+    assert _split_client_id("ABC123XYZ") == ("ABC123XYZ", "100")
+
+
+def test_request_key_missing_is_an_error():
+    from fyers_auth_automation import _request_key
+
+    with pytest.raises(RuntimeError, match="no request_key"):
+        _request_key({"s": "ok"}, "TOTP step")
+    assert _request_key({"data": {"request_key": "rk"}}, "TOTP step") == "rk"

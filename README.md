@@ -3,8 +3,8 @@
 Automated intraday options-trading system for Indian index derivatives,
 built around NIFTY 50 weekly options via the Fyers broker.
 
-Each morning it logs into Fyers automatically (headless browser +
-TOTP), subscribes to the live NIFTY spot feed, and watches 5-minute
+Each morning it logs into Fyers automatically (login APIs + TOTP),
+subscribes to the live NIFTY spot feed, and watches 5-minute
 bars for a breakout/breakdown. When a breakout is confirmed by
 order-flow/footprint signals, it buys an at-the-money NIFTY weekly
 option (1 lot = 75 qty) — a CE on a bullish breakout, a PE on a
@@ -18,8 +18,10 @@ It is controlled remotely via Telegram (`/status`, `/pause`,
 
 ## How it works (live path)
 
-1. `fyers_auth_automation.py` — headless daily login, TOTP + PIN,
-   token cached for the current day only (Fyers tokens expire daily).
+1. `fyers_auth_automation.py` — daily login through Fyers' login
+   APIs (no browser: the login page gates Continue behind a human
+   check automation cannot complete), TOTP + PIN, token cached for
+   the current day only (Fyers tokens expire daily).
 2. `main_jev_orchestrator.py` — entry point. Fetches real PDH/PDL/PDC
    and weekly/monthly profile levels, seeds today's completed
    5-minute bars from history, then streams NIFTY spot ticks.
@@ -53,8 +55,8 @@ python main_jev_orchestrator.py
 
 Python 3.10–3.12. Dependencies are pinned in `requirements.txt`
 (verified to install together; note `fyers-apiv3==3.2.1` pins
-`requests==2.31.0`). Playwright needs a browser for the Fyers login:
-`playwright install chromium`.
+`requests==2.31.0`). No browser is needed for the Fyers login any
+more; Playwright remains in `requirements.txt` but is unused.
 
 ## Configuration
 
@@ -64,7 +66,7 @@ GitHub Actions they come from repository Secrets.
 | Variable | Default | Notes |
 | --- | --- | --- |
 | `FYERS_APP_ID`, `FYERS_SECRET_KEY`, `FYERS_ID`, `FYERS_PIN`, `FYERS_TOTP_KEY` | — | Fyers credentials (Secrets) |
-| `FYERS_ACCESS_TOKEN` | — | Optional pre-obtained token, skips the browser login |
+| `FYERS_ACCESS_TOKEN` | — | Optional pre-obtained token, skips the API login |
 | `FYERS_EXPIRY_OVERRIDE` | — | `YYYY-MM-DD` override for the weekly expiry, e.g. a holiday Thursday |
 | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` | — | Telegram alerts / commands |
 | `PAPER_MODE` | `True` | `False` only for live trading with real funds |
