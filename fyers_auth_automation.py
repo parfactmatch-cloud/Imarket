@@ -1,19 +1,49 @@
 """
 fyers_auth_automation.py
-100% Automated Headless Auth using Playwright.
-Handles Fyers' new Login UI: Official Slash Redirect URI -> Client ID Tab -> Fresh TOTP -> Auto-Submit PIN Capture.
+100% Automated Auth using Fyers' own login APIs (no browser).
+
+Why no browser: the Fyers login page gates its Continue button behind
+a Cloudflare "Verify you are human" checkbox. That was verified on
+16 Nov 2026 by typing the real Client ID into the live login page:
+Continue stayed disabled with no error message, and the checkbox was
+the only thing left undone. Headless automation cannot complete that
+check, so the old Playwright flow could never get past Step 1/2.
+This module instead calls the same login APIs the page itself uses
+(send_login_otp -> verify_otp -> verify_pin -> token), which need no
+page, no checkbox and no browser.
+
+These vagator endpoints are NOT in Fyers' official API docs
+(myapi.fyers.in/docsv3 documents only the browser login flow); they
+come from community automation guides and may change without notice.
+Every step names itself in its error, so a Fyers-side change shows up
+as the exact step that broke instead of a generic stall.
+
+Flow:
+  1. POST api-t2.fyers.in/vagator/v2/send_login_otp
+     {"fy_id": client_id, "app_id": "2"} -> request_key
+  2. POST .../verify_otp {"request_key", "otp": fresh TOTP} -> request_key
+     (retried once with a fresh TOTP: codes rotate every 30s)
+  3. POST .../verify_pin
+     {"request_key", "identity_type": "pin", "identifier": PIN}
+     -> trade access_token
+  4. POST api-t1.fyers.in/api/v3/token with the trade token as a
+     Bearer header -> HTTP 308, body {"Url": "...?auth_code=..."}
+  5. POST api-t1.fyers.in/api/v3/validate-authcode with the auth_code
+     and appIdHash (SHA-256 of app_id:app_secret) -> API access_token.
+
+Secrets (PIN, TOTP key) are never logged, not even partially.
 """
 
+import hashlib
+import json
+import logging
 import os
 import time
-import json
-import hashlib
-import logging
 import urllib.parse
 from datetime import datetime, timezone, timedelta
+
 import pyotp
 import requests
-from playwright.sync_api import sync_playwright
 
 logger = logging.getLogger(__name__)
 
@@ -26,120 +56,73 @@ TOKEN_URL = "https://api-t1.fyers.in/api/v3/validate-authcode"
 # when it was saved today (IST); anything older is regenerated.
 REQUEST_TIMEOUT_SECONDS = 30
 
-# Phrases Fyers shows when a login step is rejected. Checked after every
-# step so a bad Client ID / TOTP / PIN is reported as that step failing,
-# instead of the flow blindly typing the next secret into the wrong
-# screen and stalling at the login page (seen 16 Nov 2026: the run ended
-# with "Stalled | Screen: ... Login to FYERS ... Mobile number ...",
-# which said nothing about which step had failed).
-_ERROR_PHRASES = (
-    "invalid totp",
-    "invalid otp",
-    "incorrect totp",
-    "incorrect otp",
-    "incorrect pin",
-    "invalid pin",
-    "wrong pin",
-    "wrong otp",
-    "otp expired",
-    "totp expired",
-    "invalid client id",
-    "invalid login",
-    "login failed",
-    "authentication failed",
-    "too many attempts",
-    "try again",
-)
+VAGATOR_BASE = "https://api-t2.fyers.in/vagator/v2"
+URL_SEND_LOGIN_OTP = VAGATOR_BASE + "/send_login_otp"
+URL_VERIFY_TOTP = VAGATOR_BASE + "/verify_otp"
+URL_VERIFY_PIN = VAGATOR_BASE + "/verify_pin"
+# Returns HTTP 308 with {"Url": "...?auth_code=..."}; it is NOT the
+# validate-authcode endpoint (that is TOKEN_URL above).
+URL_TOKEN = "https://api-t1.fyers.in/api/v3/token"
+# "2" denotes the web login in the vagator login API.
+VAGATOR_APP_ID = "2"
 
 
-def _body_text(page) -> str:
-    """Visible body text, whitespace-collapsed. Never includes input values."""
-    try:
-        return " ".join(page.inner_text("body").split())
-    except Exception:
+def _fyers_message(body) -> str:
+    """Short error text from a Fyers JSON body, without any secret."""
+    if not isinstance(body, dict):
         return ""
+    for key in ("message", "msg", "error"):
+        value = body.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()[:200]
+    return ""
 
 
-def _safe_url(url: str) -> str:
-    """Login URL with the client_id value redacted. The raw URL was
-    previously copied into Telegram alerts, broadcasting the app ID."""
+def _post_json(url: str, payload: dict, step: str, headers=None, expect_status: int = 200) -> dict:
+    """POST JSON and return the parsed body, or raise naming the step.
+
+    The payload is never included in the error: it carries the TOTP
+    and PIN. Only the HTTP status and Fyers' own message are reported.
+    """
     try:
-        parsed = urllib.parse.urlparse(url)
-        params = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
-        redacted = [(k, "***" if k == "client_id" else v) for k, v in params]
-        return urllib.parse.urlunparse(parsed._replace(query=urllib.parse.urlencode(redacted)))
-    except Exception:
-        return url
-
-
-def _screen_summary(page, limit: int = 500) -> str:
+        response = requests.post(
+            url, json=payload, headers=headers or {}, timeout=REQUEST_TIMEOUT_SECONDS,
+            allow_redirects=False,
+        )
+    except requests.RequestException as exc:
+        raise RuntimeError(f"{step} failed: network error: {exc}") from exc
     try:
-        url = _safe_url(page.url)
-    except Exception:
-        url = "?"
-    return f"URL: {url} | Screen: {_body_text(page)[:limit]}"
+        body = response.json()
+    except ValueError:
+        body = {}
+    if response.status_code != expect_status:
+        detail = _fyers_message(body) or (response.text or "")[:200]
+        raise RuntimeError(f"{step} failed: HTTP {response.status_code}: {detail}")
+    if not isinstance(body, dict):
+        raise RuntimeError(f"{step} failed: unexpected non-JSON response")
+    return body
 
 
-def _find_error_text(body_text: str) -> str | None:
-    lowered = body_text.lower()
-    for phrase in _ERROR_PHRASES:
-        if phrase in lowered:
-            start = lowered.find(phrase)
-            return body_text[max(0, start - 40):start + 120].strip()
-    return None
+def _request_key(body: dict, step: str) -> str:
+    """request_key from a vagator response (top-level or under data)."""
+    key = body.get("request_key")
+    if not key and isinstance(body.get("data"), dict):
+        key = body["data"].get("request_key")
+    if not key:
+        raise RuntimeError(f"{step} failed: no request_key in Fyers response")
+    return key
 
 
-def _raise_if_error(page, step: str) -> None:
-    error = _find_error_text(_body_text(page))
-    if error:
-        raise RuntimeError(f"{step} failed: {error} | {_screen_summary(page, 300)}")
+def _split_client_id(client_id: str) -> tuple:
+    """Split an app client_id like "ABC123XYZ-100" into (app_id, app_type).
 
-
-def _wait_for_text(page, pattern: str, step: str, timeout_ms: int = 15000) -> str:
-    """Poll the page until ``pattern`` (case-insensitive) appears, or raise
-    naming the step that did not advance and the screen it is stuck on."""
-    import re
-
-    deadline = time.time() + timeout_ms / 1000.0
-    while time.time() < deadline:
-        text = _body_text(page)
-        _raise_if_error(page, step)
-        if re.search(pattern, text, re.IGNORECASE):
-            return text
-        if "auth_code=" in getattr(page, "url", ""):
-            return text
-        time.sleep(0.5)
-    raise RuntimeError(
-        f"{step} did not advance within {timeout_ms // 1000}s | {_screen_summary(page)}"
-    )
-
-
-# Selectors used on the Fyers login page. Kept as separate strings and
-# tried in order (see _first_visible): a comma-combined selector is NOT
-# used here because Playwright's CSS parser rejects "[role='tab']"
-# inside one ("Unexpected token '='", seen in run #42 on 16 Nov 2026)
-# and one bad part breaks the whole locator.
-_TAB_SELECTORS = (
-    "button:has-text('Client ID'):visible",
-    "text='Client ID'",
-)
-_CLIENT_ID_INPUT_SELECTORS = (
-    "input#fy_client_id:visible",
-    "input[name='fy_client_id']:visible",
-)
-
-
-def _first_visible(page, selectors):
-    """First locator with a visible match, or None. A selector that
-    fails to parse is skipped instead of breaking the login."""
-    for selector in selectors:
-        try:
-            locator = page.locator(selector)
-            if locator.count() > 0:
-                return locator
-        except Exception:
-            continue
-    return None
+    The token step needs the two parts separately. An id without a
+    dash keeps the whole id as app_id with the usual "100" type.
+    """
+    if "-" in client_id:
+        app_id, app_type = client_id.rsplit("-", 1)
+        return app_id, app_type
+    return client_id, "100"
 
 
 class FyersAuthManager:
@@ -168,7 +151,7 @@ class FyersAuthManager:
         if not (self.client_id and self.secret_key and self.totp_key and self.pin and self.fyers_id):
             raise ValueError("Missing Secrets in GitHub Environment.")
 
-        auth_code = self._get_auth_code_via_browser()
+        auth_code = self._get_auth_code_via_api()
 
         app_id_hash = self._get_app_id_hash()
         token_payload = {
@@ -204,199 +187,92 @@ class FyersAuthManager:
 
         return access_token
 
-    def _get_auth_code_via_browser(self) -> str:
-        encoded_redirect = urllib.parse.quote(self.redirect_uri, safe="")
-        login_url = (
-            f"https://api-t1.fyers.in/api/v3/generate-authcode"
-            f"?client_id={self.client_id}&redirect_uri={encoded_redirect}"
-            f"&response_type=code&state=sample_state"
+    def _get_auth_code_via_api(self) -> str:
+        """Log in through Fyers' login APIs and return the auth_code."""
+        # Step 1: request_key from send_login_otp.
+        logger.info("[Auth] Step 1: requesting login OTP")
+        body = _post_json(
+            URL_SEND_LOGIN_OTP,
+            {"fy_id": self.fyers_id, "app_id": VAGATOR_APP_ID},
+            "Login OTP step",
         )
+        request_key = _request_key(body, "Login OTP step")
 
-        with sync_playwright() as p:
-            browser = p.chromium.launch(
-                headless=True,
-                args=["--disable-blink-features=AutomationControlled", "--no-sandbox"]
-            )
-            context = browser.new_context(
-                viewport={"width": 1920, "height": 1080},
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-            )
-            page = context.new_page()
-            page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-
-            page.goto(login_url, wait_until="domcontentloaded", timeout=60000)
-            page.wait_for_timeout(3000)
-
-            initial_text = page.inner_text("body")
-            if "invalid redirect" in initial_text.lower() or "invalid client" in initial_text.lower():
-                browser.close()
-                raise RuntimeError(f"App Config Error: {initial_text[:150].replace(chr(10), ' ')}")
-
-            # Step 1: Switch to 'Client ID' tab, then prove the tab opened
-            # by waiting for its specific input. The old code fell back
-            # to the first visible text input, which on the initial
-            # screen is the Mobile number field, so a failed tab switch
-            # silently typed the Client ID into the wrong field.
-            logger.info("[Auth] Step 1: opening Client ID tab")
-            client_id_tab = _first_visible(page, _TAB_SELECTORS)
-            if client_id_tab is not None:
-                client_id_tab.first.click()
-            client_id_input_loc = _first_visible(page, _CLIENT_ID_INPUT_SELECTORS)
-            if client_id_input_loc is None:
-                browser.close()
-                raise RuntimeError(
-                    f"Client ID tab did not open | {_screen_summary(page)}"
+        # Step 2: verify a fresh TOTP (retried once with a new code).
+        logger.info("[Auth] Step 2: verifying TOTP")
+        last_error = None
+        for _attempt in range(2):
+            totp = self._get_fresh_totp()
+            try:
+                body = _post_json(
+                    URL_VERIFY_TOTP,
+                    {"request_key": request_key, "otp": totp},
+                    "TOTP step",
                 )
-            try:
-                client_id_input_loc.first.wait_for(state="visible", timeout=10000)
-            except Exception as exc:
-                browser.close()
-                raise RuntimeError(
-                    f"Client ID tab did not open | {_screen_summary(page)}"
-                ) from exc
-
-            # Step 2: Type Client ID sequentially
-            logger.info("[Auth] Step 2: entering Client ID")
-            client_id_input = client_id_input_loc.first
-            client_id_input.click()
-            client_id_input.press_sequentially(self.fyers_id, delay=80)
-            page.wait_for_timeout(500)
-            # Confirm the field actually registered the typing (length
-            # only, never the value): if the page's script did not pick
-            # the keystrokes up, Continue stays disabled and Enter does
-            # nothing, which looks exactly like the run #43 stall.
-            try:
-                typed_len = len(client_id_input.input_value())
-            except Exception:
-                typed_len = -1
-            logger.info("[Auth] Client ID field length after typing: %s", typed_len)
-
-            submit_btn = page.locator("#clientIdSubmit:visible, button:has-text('Continue'):visible").first
-            try:
-                submit_desc = (
-                    f"id={submit_btn.get_attribute('id')} "
-                    f"text={submit_btn.inner_text().strip()[:30]!r} "
-                    f"disabled={submit_btn.is_disabled()}"
-                )
-            except Exception:
-                submit_desc = "unreadable"
-            logger.info("[Auth] Client ID submit button: %s", submit_desc)
-            if submit_btn.is_disabled():
-                browser.close()
-                raise RuntimeError(
-                    "Client ID Continue button is disabled after typing "
-                    f"(field length {typed_len}): Fyers did not accept the "
-                    "entered ID, or the field did not register the typing | "
-                    f"{_screen_summary(page)}"
-                )
-            submit_btn.click()
-            logger.info("[Auth] Client ID submitted, waiting for OTP screen")
-
-            # Prove the Client ID was accepted: the next screen must
-            # mention TOTP/OTP. If Fyers stays on the login screen, stop
-            # here with that fact instead of typing the TOTP into the
-            # mobile-number field and stalling at the end.
-            try:
-                _wait_for_text(page, r"TOTP|OTP|verification", "Client ID step", timeout_ms=15000)
+                request_key = _request_key(body, "TOTP step")
+                break
             except RuntimeError as exc:
-                browser.close()
-                raise RuntimeError(
-                    f"{exc} | No Fyers error message appeared, so the submit "
-                    "was not rejected with a message: the page simply did not "
-                    "move (field did not register the ID, or Fyers ignored "
-                    "the submit from this runner)"
-                ) from exc
-            _raise_if_error(page, "Client ID step")
-            logger.info("[Auth] Client ID accepted, OTP screen reached")
-            # Step 3: Enter Fresh TOTP
-            logger.info("[Auth] Step 3: entering TOTP")
-            totp_switch = page.locator("text=/TOTP/i").first
-            if totp_switch.count() > 0 and totp_switch.is_visible():
-                try:
-                    totp_switch.click()
-                    page.wait_for_timeout(1000)
-                except Exception as exc:
-                    logger.warning("TOTP switch click failed (continuing): %s", exc)
+                last_error = exc
+        else:
+            raise last_error
+        logger.info("[Auth] TOTP accepted")
 
-            visible_inputs = page.locator("input:visible").all()
-            if not visible_inputs:
-                screen_text = page.inner_text("body")[:180].replace("\n", " ")
-                browser.close()
-                raise RuntimeError(f"No inputs on TOTP step. Screen says: {screen_text}")
+        # Step 3: verify the PIN, receiving the trade access token.
+        logger.info("[Auth] Step 3: verifying PIN")
+        body = _post_json(
+            URL_VERIFY_PIN,
+            {"request_key": request_key, "identity_type": "pin", "identifier": self.pin},
+            "PIN step",
+        )
+        trade_token = ""
+        if isinstance(body.get("data"), dict):
+            trade_token = body["data"].get("access_token", "")
+        if not trade_token:
+            trade_token = body.get("access_token", "")
+        if not trade_token:
+            raise RuntimeError("PIN step failed: no access_token in Fyers response")
+        logger.info("[Auth] PIN accepted")
 
-            current_totp = self._get_fresh_totp()
-            if len(visible_inputs) >= 6:
-                for i in range(6):
-                    visible_inputs[i].click()
-                    visible_inputs[i].press_sequentially(current_totp[i], delay=50)
-            else:
-                visible_inputs[0].click()
-                visible_inputs[0].press_sequentially(current_totp, delay=60)
-
-            page.wait_for_timeout(1500)
-            if "auth_code=" not in page.url:
-                submit_otp = page.locator("#confirmOtpSubmit:visible, button:has-text('Continue'):visible, button:has-text('Verify'):visible, button[type='submit']:visible").first
-                if submit_otp.count() > 0 and not submit_otp.is_disabled():
-                    submit_otp.click()
-
-            # Prove the TOTP was accepted: the next screen must mention
-            # PIN. If Fyers rejects the TOTP it returns to the login /
-            # OTP screen, and the error check above names the reason.
-            _wait_for_text(page, r"PIN|auth_code=", "TOTP step", timeout_ms=15000)
-            _raise_if_error(page, "TOTP step")
-            logger.info("[Auth] TOTP accepted, PIN screen reached")
-
-            # Step 4: Enter 4-Digit PIN
-            logger.info("[Auth] Step 4: entering PIN")
-            pin_inputs = page.locator("input:visible").all()
-            if not pin_inputs:
-                screen_text = page.inner_text("body")[:180].replace("\n", " ")
-                browser.close()
-                raise RuntimeError(f"No inputs on PIN step. Screen says: {screen_text}")
-
-            if len(pin_inputs) >= 4:
-                for i in range(4):
-                    pin_inputs[i].click()
-                    pin_inputs[i].press_sequentially(self.pin[i], delay=50)
-            else:
-                pin_inputs[0].click()
-                pin_inputs[0].press_sequentially(self.pin, delay=60)
-
-            # Allow 2.5s for Fyers auto-submit on 4th PIN digit
-            page.wait_for_timeout(2500)
-            if "auth_code=" not in page.url:
-                submit_pin = page.locator("#verifyPinSubmit:visible, button:has-text('Continue'):visible, button:has-text('Verify'):visible, button:has-text('Submit'):visible, button[type='submit']:visible").first
-                if submit_pin.count() > 0 and not submit_pin.is_disabled():
-                    submit_pin.click()
-
-            # Step 5: Wait for Redirect & Extract Auth Code immediately upon URL commit
-            try:
-                page.wait_for_url(lambda url: "auth_code=" in url, wait_until="commit", timeout=20000)
-            except Exception as exc:
-                logger.warning("Timed out waiting for auth_code redirect: %s", exc)
-                curr_url = page.url
-                if "auth_code=" not in curr_url:
-                    _raise_if_error(page, "PIN step")
-                    browser.close()
-                    raise RuntimeError(
-                        f"Stalled after PIN step, no auth_code redirect | {_screen_summary(page)}"
-                    ) from exc
-
-            final_url = page.url
-            browser.close()
-            logger.info("[Auth] Auth code received, exchanging for token")
-
-            final_url = page.url
-            browser.close()
-
-            parsed = urllib.parse.urlparse(final_url)
-            query_params = urllib.parse.parse_qs(parsed.query)
-            auth_code = query_params.get("auth_code", [""])[0]
-
-            if not auth_code:
-                raise RuntimeError("Failed to extract auth_code from redirected URL.")
-
-            return auth_code
+        # Step 4: exchange the trade token for an auth_code.
+        logger.info("[Auth] Step 4: requesting auth code")
+        app_id, app_type = _split_client_id(self.client_id)
+        try:
+            response = requests.post(
+                URL_TOKEN,
+                json={
+                    "fyers_id": self.fyers_id,
+                    "app_id": app_id,
+                    "redirect_uri": self.redirect_uri,
+                    "appType": app_type,
+                    "code_challenge": "",
+                    "state": "sample_state",
+                    "scope": "",
+                    "nonce": "",
+                    "response_type": "code",
+                    "create_cookie": True,
+                },
+                headers={"Authorization": f"Bearer {trade_token}"},
+                timeout=REQUEST_TIMEOUT_SECONDS,
+                allow_redirects=False,
+            )
+        except requests.RequestException as exc:
+            raise RuntimeError(f"Auth code step failed: network error: {exc}") from exc
+        try:
+            token_body = response.json()
+        except ValueError:
+            token_body = {}
+        if response.status_code not in (200, 308):
+            detail = _fyers_message(token_body) or (response.text or "")[:200]
+            raise RuntimeError(f"Auth code step failed: HTTP {response.status_code}: {detail}")
+        redirect_url = token_body.get("Url", "") if isinstance(token_body, dict) else ""
+        if not redirect_url:
+            raise RuntimeError("Auth code step failed: no Url in Fyers response")
+        query_params = urllib.parse.parse_qs(urllib.parse.urlparse(redirect_url).query)
+        auth_code = query_params.get("auth_code", [""])[0]
+        if not auth_code:
+            raise RuntimeError("Auth code step failed: no auth_code in Fyers redirect URL")
+        logger.info("[Auth] Auth code received, exchanging for token")
+        return auth_code
 
     def get_valid_token(self) -> str:
         env_token = os.environ.get("FYERS_ACCESS_TOKEN", "").strip()
