@@ -60,9 +60,21 @@ def _body_text(page) -> str:
         return ""
 
 
+def _safe_url(url: str) -> str:
+    """Login URL with the client_id value redacted. The raw URL was
+    previously copied into Telegram alerts, broadcasting the app ID."""
+    try:
+        parsed = urllib.parse.urlparse(url)
+        params = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+        redacted = [(k, "***" if k == "client_id" else v) for k, v in params]
+        return urllib.parse.urlunparse(parsed._replace(query=urllib.parse.urlencode(redacted)))
+    except Exception:
+        return url
+
+
 def _screen_summary(page, limit: int = 500) -> str:
     try:
-        url = page.url
+        url = _safe_url(page.url)
     except Exception:
         url = "?"
     return f"URL: {url} | Screen: {_body_text(page)[:limit]}"
@@ -249,18 +261,51 @@ class FyersAuthManager:
             client_id_input.click()
             client_id_input.press_sequentially(self.fyers_id, delay=80)
             page.wait_for_timeout(500)
+            # Confirm the field actually registered the typing (length
+            # only, never the value): if the page's script did not pick
+            # the keystrokes up, Continue stays disabled and Enter does
+            # nothing, which looks exactly like the run #43 stall.
+            try:
+                typed_len = len(client_id_input.input_value())
+            except Exception:
+                typed_len = -1
+            logger.info("[Auth] Client ID field length after typing: %s", typed_len)
 
             submit_btn = page.locator("#clientIdSubmit:visible, button:has-text('Continue'):visible").first
+            try:
+                submit_desc = (
+                    f"id={submit_btn.get_attribute('id')} "
+                    f"text={submit_btn.inner_text().strip()[:30]!r} "
+                    f"disabled={submit_btn.is_disabled()}"
+                )
+            except Exception:
+                submit_desc = "unreadable"
+            logger.info("[Auth] Client ID submit button: %s", submit_desc)
             if submit_btn.is_disabled():
-                client_id_input.press("Enter")
-            else:
-                submit_btn.click()
+                browser.close()
+                raise RuntimeError(
+                    "Client ID Continue button is disabled after typing "
+                    f"(field length {typed_len}): Fyers did not accept the "
+                    "entered ID, or the field did not register the typing | "
+                    f"{_screen_summary(page)}"
+                )
+            submit_btn.click()
+            logger.info("[Auth] Client ID submitted, waiting for OTP screen")
 
             # Prove the Client ID was accepted: the next screen must
             # mention TOTP/OTP. If Fyers stays on the login screen, stop
             # here with that fact instead of typing the TOTP into the
             # mobile-number field and stalling at the end.
-            _wait_for_text(page, r"TOTP|OTP|verification", "Client ID step", timeout_ms=15000)
+            try:
+                _wait_for_text(page, r"TOTP|OTP|verification", "Client ID step", timeout_ms=15000)
+            except RuntimeError as exc:
+                browser.close()
+                raise RuntimeError(
+                    f"{exc} | No Fyers error message appeared, so the submit "
+                    "was not rejected with a message: the page simply did not "
+                    "move (field did not register the ID, or Fyers ignored "
+                    "the submit from this runner)"
+                ) from exc
             _raise_if_error(page, "Client ID step")
             logger.info("[Auth] Client ID accepted, OTP screen reached")
             # Step 3: Enter Fresh TOTP
