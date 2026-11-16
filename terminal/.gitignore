@@ -1,0 +1,7 @@
+# Runtime state written by server.py — not committed (except seed.json).
+snapshot.json
+plan.json
+chain.json
+events.json
+*.tmp
+__pycache__/

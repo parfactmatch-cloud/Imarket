@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Jev Terminal — NIFTY 50 · Jev Engine</title>
+<style>
+  :root { --bg:#0b0f14; --panel:#121826; --line:#1f2a3d; --text:#e6edf3; --muted:#8b98a9;
+    --green:#2ea043; --red:#f85149; --amber:#d29922; --blue:#58a6ff; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--text);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif; }
+  header { padding:14px 18px; border-bottom:1px solid var(--line); display:flex; flex-wrap:wrap;
+    gap:8px 16px; align-items:baseline; }
+  header h1 { font-size:20px; margin:0; }
+  header .sub { color:var(--muted); font-size:13px; }
+  .warn { background:#2d1f00; color:#f0b429; padding:8px 18px; font-size:13px; border-bottom:1px solid var(--line); }
+  main { padding:16px 18px 40px; max-width:1100px; margin:0 auto; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(240px,1fr)); gap:12px; }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:14px; }
+  .panel h2 { font-size:13px; text-transform:uppercase; letter-spacing:.06em; color:var(--muted); margin:0 0 10px; }
+  .big { font-size:32px; font-weight:700; }
+  .up { color:var(--green); } .down { color:var(--red); }
+  .muted { color:var(--muted); font-size:13px; }
+  .row { display:flex; justify-content:space-between; padding:5px 0; border-bottom:1px solid var(--line); font-size:14px; }
+  .row:last-child { border-bottom:none; }
+  canvas { width:100%; height:220px; display:block; }
+  .cond { padding:8px 0; border-bottom:1px solid var(--line); font-size:14px; }
+  .cond:last-child { border-bottom:none; }
+  .pill { display:inline-block; font-size:11px; font-weight:700; padding:2px 8px; border-radius:20px; margin-right:8px; }
+  .pill.met { background:#12351c; color:var(--green); }
+  .pill.unmet { background:#3a1d1d; color:var(--red); }
+  .pill.engine { background:#1c2b45; color:var(--blue); }
+  table { width:100%; border-collapse:collapse; font-size:14px; }
+  td, th { padding:5px 4px; border-bottom:1px solid var(--line); text-align:right; }
+  td:first-child, th:first-child { text-align:left; }
+  input, select, textarea, button { background:#0b0f14; color:var(--text); border:1px solid var(--line);
+    border-radius:6px; padding:7px 9px; font-size:14px; }
+  button { background:#1f6feb; border-color:#1f6feb; cursor:pointer; font-weight:600; }
+  button.secondary { background:transparent; border-color:var(--line); }
+  form .grid { grid-template-columns:repeat(auto-fit,minmax(140px,1fr)); }
+  label { display:block; font-size:12px; color:var(--muted); margin-bottom:4px; }
+  .check { padding:6px 0; font-size:14px; border-bottom:1px solid var(--line); }
+  .check:last-child { border-bottom:none; }
+  .tone-good::before { content:"✓ "; color:var(--green); }
+  .tone-warn::before { content:"⚠ "; color:var(--amber); }
+  .tone-info::before { content:"• "; color:var(--blue); }
+  #status { font-size:13px; color:var(--muted); }
+</style>
+</head>
+<body>
+<header>
+  <h1>Jev Terminal</h1>
+  <span class="sub">NIFTY 50 · Jev Engine · paper mode</span>
+  <span class="sub" id="status">Loading…</span>
+</header>
+<div class="warn">Public snapshot feed (refreshes ~5 min in market hours) — not the engine's real-time Fyers stream. Walls / POC / PCR come from the engine's own Telegram messages, logged below — not from a live chain feed.</div>
+<main>
+  <div class="grid" style="margin-bottom:12px">
+    <div class="panel"><h2>NIFTY 50 spot</h2><div class="big" id="spot">—</div>
+      <div id="change" class="muted">—</div><div class="muted" id="asof">—</div></div>
+    <div class="panel"><h2>Indices</h2>
+      <div class="row"><span>India VIX</span><b id="vix">—</b></div>
+      <div class="row"><span>Bank Nifty</span><b id="bank">—</b></div>
+      <div class="row"><span>Sensex</span><b id="sensex">—</b></div>
+      <div class="row"><span>Market</span><b id="market">—</b></div></div>
+    <div class="panel"><h2>Levels</h2>
+      <div class="row"><span>PDH / PDL</span><b id="pdhpdl">—</b></div>
+      <div class="row"><span>PDC (prev close)</span><b id="pdc">—</b></div>
+      <div class="row"><span>Week POC</span><b id="poc">—</b></div>
+      <div class="row"><span>Value area</span><b id="va">—</b></div></div>
+    <div class="panel"><h2>Engine levels (logged)</h2>
+      <div class="row"><span>Call wall / Put wall</span><b id="walls">—</b></div>
+      <div class="row"><span>Max pain / PCR</span><b id="maxpain">—</b></div>
+      <div class="row"><span>Logged</span><b id="chainDate">—</b></div></div>
+  </div>
+
+  <div class="panel" style="margin-bottom:12px"><h2>Session — 5-minute bars (<span id="chartDate">—</span>)</h2>
+    <canvas id="chart" width="1000" height="220"></canvas>
+    <div class="muted">PDH / PDL / Week POC drawn on the chart. Bars are Yahoo 5-minute closes.</div></div>
+
+  <div class="grid" style="margin-bottom:12px">
+    <div class="panel"><h2>Signal conditions — engine's checklist</h2><div id="conds">—</div>
+      <p class="muted">Dealer gamma + CVD is judged by the engine from the live Fyers chain and tick feed. Everything else is judged here from public data.</p></div>
+    <div class="panel"><h2>ATM Greeks — <span id="atm">—</span> (<span id="expiry">—</span>)</h2>
+      <div class="row"><span>CE premium / delta / theta</span><b id="ce">—</b></div>
+      <div class="row"><span>PE premium / delta / theta</span><b id="pe">—</b></div>
+      <div class="row"><span>Gamma / Vega (per 1% IV)</span><b id="gv">—</b></div>
+      <div class="row"><span>IV (India VIX)</span><b id="iv">—</b></div>
+      <h2 style="margin-top:14px">Premium if spot moves</h2>
+      <table><thead><tr><th>Move</th><th>CE ₹</th><th>PE ₹</th></tr></thead><tbody id="scen"></tbody></table></div>
+    <div class="panel"><h2>Gamma-blast watch</h2><div id="blast">—</div>
+      <p class="muted">Window 14:00–15:08 IST on expiry day. The blast detector is NOT wired into the live engine — it is a library module only. Any blast play is manual, sized for a ~30% hit rate.</p></div>
+  </div>
+
+  <div class="panel" style="margin-bottom:12px"><h2>Post-market plan — <span id="planDate">—</span></h2>
+    <div id="plan">—</div>
+    <h2 style="margin-top:14px">Risk rules</h2><div id="risk" class="muted">—</div>
+    <div style="margin-top:10px"><button id="rebuildPlan" class="secondary">Rebuild plan from latest snapshot</button></div>
+    <div style="margin-top:10px"><label for="planNote">Your note on this plan</label>
+      <textarea id="planNote" rows="2" style="width:100%"></textarea>
+      <button id="saveNote" class="secondary" style="margin-top:6px">Save note</button></div></div>
+
+  <div class="grid">
+    <div class="panel"><h2>Log engine levels</h2>
+      <p class="muted">After the 9:15 run, paste the Week POC from the System Online message and the walls from the live chain. Nothing here is guessed.</p>
+      <form id="chainForm"><div class="grid">
+        <div><label>Week POC</label><input name="weekPoc" type="number" step="0.01" placeholder="25131.55"></div>
+        <div><label>Call wall</label><input name="callWall" type="number" step="1" placeholder="26000"></div>
+        <div><label>Put wall</label><input name="putWall" type="number" step="1" placeholder="25000"></div>
+        <div><label>Max pain</label><input name="maxPain" type="number" step="1" placeholder="25200"></div>
+        <div><label>PCR</label><input name="pcr" type="number" step="0.01" placeholder="0.90"></div>
+      </div><button type="submit" style="margin-top:10px">Log levels</button> <span id="chainMsg" class="muted"></span></form></div>
+    <div class="panel"><h2>Engine session log</h2><div id="events">—</div>
+      <form id="eventForm" style="margin-top:10px"><div class="grid">
+        <div><label>Type</label><select name="kind"><option value="online">System online</option><option value="signal">Signal</option><option value="position">Position update</option><option value="squareoff">Square-off</option><option value="closed">Session closed</option><option value="note">Note</option></select></div>
+        <div><label>Message (as on Telegram)</label><input name="text" style="width:100%" placeholder="System Online (Live Feed) — Paper Mode"></div>
+      </div><button type="submit" style="margin-top:10px">Add entry</button></form></div>
+  </div>
+</main>
+<script src="/app.js"></script>
+</body>
+</html>
