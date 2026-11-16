@@ -396,6 +396,19 @@ def test_historical_levels_failure_is_not_ok(monkeypatch):
     assert levels["pdc"] == 23900.0
 
 
+def test_signal_alert_shows_sl_t1_t2():
+    import main_jev_orchestrator as orch
+
+    text = orch._signal_alert_details(
+        spot=25180, imb_tag="Stacked Buy: 3 lvls", ctx_tag="IMBALANCE_BULLISH",
+        bar_delta=12400, strike=25200, option_type="CE", premium=68,
+        expiry=date(2026, 11, 19), sl=34.0, t1=102.0, t2=136.0, qty=75)
+    assert "SL: 34.0 | T1: 102.0 | T2: 136.0 | Qty: 75" in text
+    assert "Strike: NIFTY 25200 CE | Premium: 68" in text
+    assert "Spot: 25180 | Stacked Buy: 3 lvls" in text
+    assert "Expiry: 2026-11-19" in text
+
+
 # ---------------------------------------------------------------- Fyers API login (no browser)
 class _FakeResponse:
     def __init__(self, status_code, body):
