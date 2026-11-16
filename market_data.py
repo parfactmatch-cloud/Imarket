@@ -16,6 +16,8 @@ raising or inventing a price. Callers must treat ``None`` as
   fetched or parsed, in which case the lag engine must not signal
   (it treats a ``None`` dealer exposure as NEUTRAL). This replaces the
   old hardcoded ``dealer_net_dex=125000`` constant.
+- ``compute_gex_snapshot``: the full GEX snapshot behind that number
+  (call wall, put wall, gamma flip, regime). Same None contract.
 """
 
 import logging
@@ -23,7 +25,7 @@ import math
 from typing import List, Optional
 
 from expiry import time_to_expiry_years
-from india_gex_engine import IndiaGEXEngine, OptionStrikeData
+from india_gex_engine import GEXSnapshot, IndiaGEXEngine, OptionStrikeData
 
 logger = logging.getLogger(__name__)
 
@@ -140,17 +142,17 @@ def fetch_option_chain(fyers_client, symbol: str = "NSE:NIFTY50-INDEX") -> Optio
     return chain
 
 
-def compute_dealer_net_dex(
+def compute_gex_snapshot(
     fyers_client,
     spot_price: float,
     expiry,
     underlying: str = "NIFTY",
     symbol: str = "NSE:NIFTY50-INDEX",
-) -> Optional[float]:
-    """Net dealer gamma exposure from the live option chain, or None.
+) -> Optional[GEXSnapshot]:
+    """Full GEX snapshot (walls, flip level, regime) from the live chain.
 
-    None means "unknown" -- callers must not signal on it. It is never
-    replaced with a hardcoded constant.
+    Returns None when the chain cannot be fetched or parsed, in which
+    case callers must not signal -- never fall back to a constant.
     """
     if spot_price is None or spot_price <= 0:
         return None
@@ -170,4 +172,21 @@ def compute_dealer_net_dex(
         return None
     logger.info("GEX net_dex=%.2f regime=%s flip=%.2f",
                 snapshot.net_gex, snapshot.market_regime, snapshot.gamma_flip_level)
-    return float(snapshot.net_gex)
+    return snapshot
+
+
+def compute_dealer_net_dex(
+    fyers_client,
+    spot_price: float,
+    expiry,
+    underlying: str = "NIFTY",
+    symbol: str = "NSE:NIFTY50-INDEX",
+) -> Optional[float]:
+    """Net dealer gamma exposure from the live option chain, or None.
+
+    None means "unknown" -- callers must not signal on it. It is never
+    replaced with a hardcoded constant.
+    """
+    snapshot = compute_gex_snapshot(fyers_client, spot_price, expiry,
+                                    underlying=underlying, symbol=symbol)
+    return float(snapshot.net_gex) if snapshot is not None else None

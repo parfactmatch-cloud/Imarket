@@ -18,7 +18,7 @@ from fyers_auth_automation import FyersAuthManager
 from gamma_blast_detector import GammaBlastDetector, StrikeTelemetry
 from greeks_structural_engine import BarData, GreeksState, GreeksStructuralEngine
 from lag_neutralized_engine import FastBar, LagNeutralizedEngine
-from market_data import compute_dealer_net_dex, get_option_quote
+from market_data import compute_dealer_net_dex, compute_gex_snapshot, get_option_quote
 from mtf_profile_context_builder import MTFProfileContextBuilder, ProfileLevels
 from position_monitor import PositionMonitor
 
@@ -323,6 +323,32 @@ def test_gex_returns_none_on_garbage_chain():
     assert compute_dealer_net_dex(BadChain(), 24000.0, date(2026, 11, 26)) is None
 
 
+def test_gex_snapshot_returns_walls():
+    class FakeChain:
+        def optionchain(self, data):
+            rows = []
+            for strike, call_oi, put_oi in [
+                (23800, 1000, 6000),
+                (23900, 2000, 3000),
+                (24000, 3000, 2000),
+                (24100, 4000, 1000),
+                (24200, 5000, 500),
+            ]:
+                rows.append({
+                    "strike_price": strike,
+                    "call": {"oi": call_oi, "iv": 0.14, "ltp": 50.0},
+                    "put": {"oi": put_oi, "iv": 0.14, "ltp": 50.0},
+                })
+            return {"s": "ok", "data": {"optionsChain": rows}}
+
+    snap = compute_gex_snapshot(FakeChain(), 24000.0, date(2026, 11, 26))
+    assert snap is not None
+    assert snap.call_wall == 24200  # highest call OI
+    assert snap.put_wall == 23800   # highest put OI
+    # The net-DEX helper still reads the same snapshot.
+    assert compute_dealer_net_dex(FakeChain(), 24000.0, date(2026, 11, 26)) == float(snap.net_gex)
+
+
 # ---------------------------------------------------------------- auth token expiry
 def _auth_manager(tmp_path, monkeypatch):
     monkeypatch.delenv("FYERS_ACCESS_TOKEN", raising=False)
@@ -407,6 +433,27 @@ def test_signal_alert_shows_sl_t1_t2():
     assert "Strike: NIFTY 25200 CE | Premium: 68" in text
     assert "Spot: 25180 | Stacked Buy: 3 lvls" in text
     assert "Expiry: 2026-11-19" in text
+
+
+def test_signal_alert_shows_walls_and_poc():
+    import main_jev_orchestrator as orch
+
+    text = orch._signal_alert_details(
+        spot=25180, imb_tag="Stacked Buy: 3 lvls", ctx_tag="IMBALANCE_BULLISH",
+        bar_delta=12400, strike=25200, option_type="CE", premium=68,
+        expiry=date(2026, 11, 19), sl=34.0, t1=102.0, t2=136.0, qty=75,
+        call_wall=25300.0, put_wall=25000.0, week_poc=25131.55)
+    assert "Walls: C 25300 / P 25000 | Week POC: 25131.55" in text
+
+
+def test_signal_alert_shows_na_without_walls():
+    import main_jev_orchestrator as orch
+
+    text = orch._signal_alert_details(
+        spot=25180, imb_tag="CVD Confirmed", ctx_tag="BREAKOUT",
+        bar_delta=100, strike=25200, option_type="CE", premium=68,
+        expiry=date(2026, 11, 19), sl=34.0, t1=102.0, t2=136.0, qty=75)
+    assert "Walls: C n/a / P n/a | Week POC: n/a" in text
 
 
 # ---------------------------------------------------------------- Fyers API login (no browser)
