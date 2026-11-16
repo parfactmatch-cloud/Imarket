@@ -67,7 +67,7 @@ GitHub Actions they come from repository Secrets.
 | --- | --- | --- |
 | `FYERS_APP_ID`, `FYERS_SECRET_KEY`, `FYERS_ID`, `FYERS_PIN`, `FYERS_TOTP_KEY` | — | Fyers credentials (Secrets) |
 | `FYERS_ACCESS_TOKEN` | — | Optional pre-obtained token, skips the API login |
-| `FYERS_EXPIRY_OVERRIDE` | — | `YYYY-MM-DD` override for the weekly expiry, e.g. a holiday Thursday |
+| `FYERS_EXPIRY_OVERRIDE` | — | `YYYY-MM-DD` override for the weekly expiry, e.g. a holiday Tuesday |
 | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` | — | Telegram alerts / commands |
 | `PAPER_MODE` | `True` | `False` only for live trading with real funds |
 | `LOT_SIZE` | `75` | NIFTY option lot size |
@@ -131,9 +131,10 @@ These fixes address every finding:
 - **Real dealer gamma:** computed from the live option chain via
   `IndiaGEXEngine`; the hardcoded `125000` constant is gone. If the
   chain cannot be fetched, the engine returns HOLD.
-- **Weekly expiry:** symbols are built from the next Thursday expiry
-  (before 15:30 IST on Thursday itself), not a hardcoded `26NOV`.
-  Set `FYERS_EXPIRY_OVERRIDE` when that Thursday is a holiday.
+- **Weekly expiry:** symbols are built from the next Tuesday expiry
+  (before 15:30 IST on Tuesday itself), not a hardcoded `26NOV`.
+  Set `FYERS_EXPIRY_OVERRIDE` when that Tuesday is a holiday.
+  NIFTY weeklies moved from Thursday to Tuesday on 1 Sep 2025 (NSE/SEBI).
 - **Exit management:** the position monitor exits on stop-loss and
   targets, moves the stop to breakeven at target 1, and squares off
   at 15:20 IST. `/panic` exits at market price.
@@ -164,7 +165,7 @@ These fixes address every finding:
   high/low inset by 15% of the range and POC is the midpoint. Do not
   treat them as a real volume profile.
 - **Expiry holidays are not known from the calendar.** If the
-  Thursday expiry is a trading holiday, set `FYERS_EXPIRY_OVERRIDE`.
+  Tuesday expiry is a trading holiday, set `FYERS_EXPIRY_OVERRIDE`.
 - **Option symbol format** (`NSE:NIFTY26NOV23250CE`, DDMMM) follows
   the repo's existing convention. Verify it against the Fyers symbol
   master before any live use.

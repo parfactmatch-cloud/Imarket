@@ -155,7 +155,7 @@ with spot, and they move *fast* near expiry. Worked numbers below
 
 Read the table top to bottom: the same strike's delta *collapses*
 as expiry approaches unless spot moves toward it. A 25300 CE bought
-on Monday at delta 0.32 is a delta-0.04 lottery ticket by Thursday
+on Monday at delta 0.32 is a delta-0.04 lottery ticket by Tuesday
 morning if NIFTY has not moved. **Time kills delta on OTM options
 first.**
 
@@ -217,7 +217,7 @@ want it live, that is a build job — say so and it can be wired in
 with the same paper-mode safety. What follows is what the module
 itself requires (**code**).
 
-**Time window: 2:00 PM – 3:08 PM IST, expiry day (Thursday, 0DTE).**
+**Time window: 2:00 PM – 3:08 PM IST, expiry day (Tuesday, 0DTE).**
 Why then: it is the last window before RMS square-off. Dealers
 holding short gamma into the close must hedge *now*; there is no
 tomorrow to spread the hedging over. After 3:08 PM there is not
@@ -350,7 +350,7 @@ Example alert:
 > **NIFTY BUY SIGNAL**
 > Spot: 25180 | Stacked Buy: 3 lvls
 > Context: IMBALANCE_BULLISH | Bar Delta: +12,400
-> Strike: NIFTY 25200 CE | Premium: 68 | Expiry: 2026-11-19
+> Strike: NIFTY 25200 CE | Premium: 68 | Expiry: 2026-11-17
 > SL: 34 | T1: 102 | T2: 136 | Qty: 75
 
 - **Spot 25180** — above PDC (bullish bias) and above the 6-bar
