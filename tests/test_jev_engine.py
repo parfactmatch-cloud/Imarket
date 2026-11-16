@@ -110,15 +110,21 @@ def test_lag_engine_hold_before_sub_bar_maturity():
 
 # ---------------------------------------------------------------- expiry
 def test_next_weekly_expiry_from_monday():
-    assert next_weekly_expiry(datetime(2026, 11, 16, 10, 0, tzinfo=IST)) == date(2026, 11, 19)
+    assert next_weekly_expiry(datetime(2026, 11, 16, 10, 0, tzinfo=IST)) == date(2026, 11, 17)
 
 
-def test_next_weekly_expiry_thursday_before_close():
-    assert next_weekly_expiry(datetime(2026, 11, 19, 10, 0, tzinfo=IST)) == date(2026, 11, 19)
+def test_next_weekly_expiry_tuesday_before_close():
+    assert next_weekly_expiry(datetime(2026, 11, 17, 10, 0, tzinfo=IST)) == date(2026, 11, 17)
 
 
-def test_next_weekly_expiry_thursday_after_close_rolls_forward():
-    assert next_weekly_expiry(datetime(2026, 11, 19, 16, 0, tzinfo=IST)) == date(2026, 11, 26)
+def test_next_weekly_expiry_tuesday_after_close_rolls_forward():
+    assert next_weekly_expiry(datetime(2026, 11, 17, 16, 0, tzinfo=IST)) == date(2026, 11, 24)
+
+
+def test_next_weekly_expiry_thursday_is_not_expiry():
+    # NIFTY weeklies moved Thursday -> Tuesday on 1 Sep 2025: a Thursday
+    # now rolls forward to the next Tuesday, it is never expiry itself.
+    assert next_weekly_expiry(datetime(2026, 11, 19, 10, 0, tzinfo=IST)) == date(2026, 11, 24)
 
 
 def test_next_weekly_expiry_override():
@@ -128,6 +134,7 @@ def test_next_weekly_expiry_override():
 
 def test_option_symbol_format():
     assert option_symbol("NIFTY", date(2026, 11, 26), 23250, "CE") == "NSE:NIFTY26NOV23250CE"
+    assert option_symbol("NIFTY", date(2026, 11, 17), 25300, "CE") == "NSE:NIFTY17NOV25300CE"
     assert option_symbol("NIFTY", date(2026, 12, 3), 24000, "PE") == "NSE:NIFTY03DEC24000PE"
 
 
@@ -402,11 +409,11 @@ def test_signal_alert_shows_sl_t1_t2():
     text = orch._signal_alert_details(
         spot=25180, imb_tag="Stacked Buy: 3 lvls", ctx_tag="IMBALANCE_BULLISH",
         bar_delta=12400, strike=25200, option_type="CE", premium=68,
-        expiry=date(2026, 11, 19), sl=34.0, t1=102.0, t2=136.0, qty=75)
+        expiry=date(2026, 11, 17), sl=34.0, t1=102.0, t2=136.0, qty=75)
     assert "SL: 34.0 | T1: 102.0 | T2: 136.0 | Qty: 75" in text
     assert "Strike: NIFTY 25200 CE | Premium: 68" in text
     assert "Spot: 25180 | Stacked Buy: 3 lvls" in text
-    assert "Expiry: 2026-11-19" in text
+    assert "Expiry: 2026-11-17" in text
 
 
 # ---------------------------------------------------------------- Fyers API login (no browser)

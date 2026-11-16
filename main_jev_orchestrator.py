@@ -14,7 +14,7 @@ Fixes applied over v3.6 (see README "What was fixed"):
 - Dealer gamma comes from IndiaGEXEngine on the live option chain,
   not a hardcoded constant; if the chain cannot be fetched, no
   signal is generated.
-- Option symbols use the computed weekly (Thursday) expiry, not a
+- Option symbols use the computed weekly (Tuesday) expiry, not a
   hardcoded "26NOV".
 - A position monitor exits on stop-loss / targets and squares off
   before the close; /panic exits at the current market price.

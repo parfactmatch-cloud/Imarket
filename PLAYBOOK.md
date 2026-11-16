@@ -14,7 +14,7 @@ trades with real money unless you explicitly set `PAPER_MODE=False`.
 | Mode | Paper by default. Virtual cash ₹200,000. 1 lot = 75 qty |
 | Risk limits | Max daily loss ₹10,000 · max 3 trades/day · max 1 open position |
 | Exits | Stop-loss, target 1, target 2, breakeven moves, square-off 15:20 IST, session ends 15:30 IST |
-| Expiry | Next Thursday (override: `FYERS_EXPIRY_OVERRIDE`) |
+| Expiry | Next Tuesday (override: `FYERS_EXPIRY_OVERRIDE`) |
 | Control | Telegram `/status`, `/pause`, `/resume`, `/panic` |
 
 ## A normal day (what should happen)
@@ -125,7 +125,7 @@ backtested and has never traded live. Before ever setting
 
 - **PR #1** — fixed signals that could never fire, unreachable live
   execution, and spot-based pricing. Live config: premium-based
-  orders, dealer gamma from the live chain, Thursday expiry, exit
+  orders, dealer gamma from the live chain, Tuesday expiry, exit
   management, risk limits.
 - **PRs #2–#5** — chased a Fyers browser-login failure ("Stalled",
   then a selector crash, then Continue staying disabled). Each run

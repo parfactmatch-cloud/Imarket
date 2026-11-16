@@ -81,7 +81,7 @@ class JevConfig:
     square_off_time: str = SQUARE_OFF_TIME
     market_close_time: str = MARKET_CLOSE_TIME
     # Optional YYYY-MM-DD override for the weekly expiry, e.g. when the
-    # Thursday expiry is a trading holiday. Empty means "compute it".
+    # Tuesday expiry is a trading holiday. Empty means "compute it".
     expiry_override: str = ""
     log_level: str = "INFO"
 
