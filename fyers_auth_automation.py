@@ -18,7 +18,10 @@ from playwright.sync_api import sync_playwright
 logger = logging.getLogger(__name__)
 
 IST = timezone(timedelta(hours=5, minutes=30))
-TOKEN_URL = "https://api-t1.fyers.in/api/v3/token"
+# Current Fyers docs (myapi.fyers.in/docsv3, Individual App Authentication):
+# exchange the auth code at POST /api/v3/validate-authcode with
+# {grant_type: "authorization_code", appIdHash, code}.
+TOKEN_URL = "https://api-t1.fyers.in/api/v3/validate-authcode"
 # Fyers access tokens expire daily. A cached token is only trusted
 # when it was saved today (IST); anything older is regenerated.
 REQUEST_TIMEOUT_SECONDS = 30
@@ -97,6 +100,34 @@ def _wait_for_text(page, pattern: str, step: str, timeout_ms: int = 15000) -> st
     raise RuntimeError(
         f"{step} did not advance within {timeout_ms // 1000}s | {_screen_summary(page)}"
     )
+
+
+# Selectors used on the Fyers login page. Kept as separate strings and
+# tried in order (see _first_visible): a comma-combined selector is NOT
+# used here because Playwright's CSS parser rejects "[role='tab']"
+# inside one ("Unexpected token '='", seen in run #42 on 16 Nov 2026)
+# and one bad part breaks the whole locator.
+_TAB_SELECTORS = (
+    "button:has-text('Client ID'):visible",
+    "text='Client ID'",
+)
+_CLIENT_ID_INPUT_SELECTORS = (
+    "input#fy_client_id:visible",
+    "input[name='fy_client_id']:visible",
+)
+
+
+def _first_visible(page, selectors):
+    """First locator with a visible match, or None. A selector that
+    fails to parse is skipped instead of breaking the login."""
+    for selector in selectors:
+        try:
+            locator = page.locator(selector)
+            if locator.count() > 0:
+                return locator
+        except Exception:
+            continue
+    return None
 
 
 class FyersAuthManager:
@@ -195,15 +226,17 @@ class FyersAuthManager:
             # screen is the Mobile number field, so a failed tab switch
             # silently typed the Client ID into the wrong field.
             logger.info("[Auth] Step 1: opening Client ID tab")
-            client_id_tab = page.locator(
-                "button:has-text('Client ID'):visible, [role='tab']:has-text('Client ID'):visible, text='Client ID'"
-            ).first
-            if client_id_tab.count() > 0:
-                client_id_tab.click()
-            try:
-                page.locator("input#fy_client_id:visible, input[name='fy_client_id']:visible").first.wait_for(
-                    state="visible", timeout=10000
+            client_id_tab = _first_visible(page, _TAB_SELECTORS)
+            if client_id_tab is not None:
+                client_id_tab.first.click()
+            client_id_input_loc = _first_visible(page, _CLIENT_ID_INPUT_SELECTORS)
+            if client_id_input_loc is None:
+                browser.close()
+                raise RuntimeError(
+                    f"Client ID tab did not open | {_screen_summary(page)}"
                 )
+            try:
+                client_id_input_loc.first.wait_for(state="visible", timeout=10000)
             except Exception as exc:
                 browser.close()
                 raise RuntimeError(
@@ -212,7 +245,7 @@ class FyersAuthManager:
 
             # Step 2: Type Client ID sequentially
             logger.info("[Auth] Step 2: entering Client ID")
-            client_id_input = page.locator("input#fy_client_id:visible, input[name='fy_client_id']:visible").first
+            client_id_input = client_id_input_loc.first
             client_id_input.click()
             client_id_input.press_sequentially(self.fyers_id, delay=80)
             page.wait_for_timeout(500)
