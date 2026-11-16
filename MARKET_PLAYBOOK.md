@@ -351,6 +351,7 @@ Example alert:
 > Spot: 25180 | Stacked Buy: 3 lvls
 > Context: IMBALANCE_BULLISH | Bar Delta: +12,400
 > Strike: NIFTY 25200 CE | Premium: 68 | Expiry: 2026-11-19
+> SL: 34 | T1: 102 | T2: 136 | Qty: 75
 
 - **Spot 25180** — above PDC (bullish bias) and above the 6-bar
   ceiling (breakout), at 260+ seconds into the bar.
@@ -360,7 +361,9 @@ Example alert:
   new value higher, not a return to POC.
 - **Bar Delta +12,400** — aggressive buyers outnumbered sellers by
   12,400 contracts in this bar.
-- **Strike 25200 CE, premium ₹68** — ATM, delta ≈ 0.50. Stop-loss
-  ₹34 (50%), target 1 ₹102 (150%), target 2 ₹136 (200%).
+- **Strike 25200 CE, premium ₹68** — ATM, delta ≈ 0.50. The last
+  line is the risk, now shown in the message itself (PR #9):
+  stop-loss ₹34 (50%), target 1 ₹102 (150%), target 2 ₹136 (200%),
+  1 lot of 75.
   A 100-point NIFTY move would take the premium to ~₹129 — just
   short of target 2. A 200-point move takes it to ~₹209.
