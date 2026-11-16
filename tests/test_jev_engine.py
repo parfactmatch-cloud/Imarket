@@ -394,3 +394,53 @@ def test_historical_levels_failure_is_not_ok(monkeypatch):
     # Defaults are present in the dict but flagged unusable -- the
     # orchestrator must not trade on them.
     assert levels["pdc"] == 23900.0
+
+
+# ---------------------------------------------------------------- Fyers auth diagnostics
+class _FakePage:
+    def __init__(self, text, url="https://api-t1.fyers.in/api/v3/generate-authcode"):
+        self._text = text
+        self.url = url
+
+    def inner_text(self, _selector):
+        return self._text
+
+
+def test_auth_error_phrase_is_found():
+    from fyers_auth_automation import _find_error_text
+
+    assert _find_error_text("Login to FYERS Invalid OTP. Please try again.") is not None
+    assert "Invalid OTP" in _find_error_text("Login to FYERS Invalid OTP. Please try again.")
+    assert _find_error_text("Login to FYERS Mobile number Client ID +91 Continue") is None
+
+
+def test_auth_screen_summary_includes_url_and_text():
+    from fyers_auth_automation import _screen_summary
+
+    summary = _screen_summary(_FakePage("Login to FYERS\nMobile number"))
+    assert "api-t1.fyers.in" in summary
+    assert "Login to FYERS" in summary
+    assert "Mobile number" in summary
+
+
+def test_auth_wait_for_text_raises_naming_the_stuck_step():
+    from fyers_auth_automation import _wait_for_text
+
+    page = _FakePage("Learn more Login to FYERS Mobile number Client ID +91 Continue")
+    with pytest.raises(RuntimeError, match="Client ID step did not advance"):
+        _wait_for_text(page, r"TOTP|OTP", "Client ID step", timeout_ms=100)
+
+
+def test_auth_wait_for_text_returns_when_otp_screen_appears():
+    from fyers_auth_automation import _wait_for_text
+
+    page = _FakePage("Enter your TOTP to continue")
+    assert "TOTP" in _wait_for_text(page, r"TOTP|OTP", "Client ID step", timeout_ms=100)
+
+
+def test_auth_raise_if_error_names_the_rejected_step():
+    from fyers_auth_automation import _raise_if_error
+
+    page = _FakePage("Incorrect PIN. Please try again.")
+    with pytest.raises(RuntimeError, match="PIN step failed"):
+        _raise_if_error(page, "PIN step")
