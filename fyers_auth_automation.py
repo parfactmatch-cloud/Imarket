@@ -23,6 +23,81 @@ TOKEN_URL = "https://api-t1.fyers.in/api/v3/token"
 # when it was saved today (IST); anything older is regenerated.
 REQUEST_TIMEOUT_SECONDS = 30
 
+# Phrases Fyers shows when a login step is rejected. Checked after every
+# step so a bad Client ID / TOTP / PIN is reported as that step failing,
+# instead of the flow blindly typing the next secret into the wrong
+# screen and stalling at the login page (seen 16 Nov 2026: the run ended
+# with "Stalled | Screen: ... Login to FYERS ... Mobile number ...",
+# which said nothing about which step had failed).
+_ERROR_PHRASES = (
+    "invalid totp",
+    "invalid otp",
+    "incorrect totp",
+    "incorrect otp",
+    "incorrect pin",
+    "invalid pin",
+    "wrong pin",
+    "wrong otp",
+    "otp expired",
+    "totp expired",
+    "invalid client id",
+    "invalid login",
+    "login failed",
+    "authentication failed",
+    "too many attempts",
+    "try again",
+)
+
+
+def _body_text(page) -> str:
+    """Visible body text, whitespace-collapsed. Never includes input values."""
+    try:
+        return " ".join(page.inner_text("body").split())
+    except Exception:
+        return ""
+
+
+def _screen_summary(page, limit: int = 500) -> str:
+    try:
+        url = page.url
+    except Exception:
+        url = "?"
+    return f"URL: {url} | Screen: {_body_text(page)[:limit]}"
+
+
+def _find_error_text(body_text: str) -> str | None:
+    lowered = body_text.lower()
+    for phrase in _ERROR_PHRASES:
+        if phrase in lowered:
+            start = lowered.find(phrase)
+            return body_text[max(0, start - 40):start + 120].strip()
+    return None
+
+
+def _raise_if_error(page, step: str) -> None:
+    error = _find_error_text(_body_text(page))
+    if error:
+        raise RuntimeError(f"{step} failed: {error} | {_screen_summary(page, 300)}")
+
+
+def _wait_for_text(page, pattern: str, step: str, timeout_ms: int = 15000) -> str:
+    """Poll the page until ``pattern`` (case-insensitive) appears, or raise
+    naming the step that did not advance and the screen it is stuck on."""
+    import re
+
+    deadline = time.time() + timeout_ms / 1000.0
+    while time.time() < deadline:
+        text = _body_text(page)
+        _raise_if_error(page, step)
+        if re.search(pattern, text, re.IGNORECASE):
+            return text
+        if "auth_code=" in getattr(page, "url", ""):
+            return text
+        time.sleep(0.5)
+    raise RuntimeError(
+        f"{step} did not advance within {timeout_ms // 1000}s | {_screen_summary(page)}"
+    )
+
 
 class FyersAuthManager:
     def __init__(self, client_id: str, secret_key: str, redirect_uri: str, fyers_id: str, pin: str, totp_key: str):
@@ -114,15 +189,30 @@ class FyersAuthManager:
                 browser.close()
                 raise RuntimeError(f"App Config Error: {initial_text[:150].replace(chr(10), ' ')}")
 
-            # Step 1: Switch to 'Client ID' tab
-            client_id_tab = page.locator("text='Client ID'").first
+            # Step 1: Switch to 'Client ID' tab, then prove the tab opened
+            # by waiting for its specific input. The old code fell back
+            # to the first visible text input, which on the initial
+            # screen is the Mobile number field, so a failed tab switch
+            # silently typed the Client ID into the wrong field.
+            logger.info("[Auth] Step 1: opening Client ID tab")
+            client_id_tab = page.locator(
+                "button:has-text('Client ID'):visible, [role='tab']:has-text('Client ID'):visible, text='Client ID'"
+            ).first
             if client_id_tab.count() > 0:
                 client_id_tab.click()
-                page.wait_for_timeout(1000)
+            try:
+                page.locator("input#fy_client_id:visible, input[name='fy_client_id']:visible").first.wait_for(
+                    state="visible", timeout=10000
+                )
+            except Exception as exc:
+                browser.close()
+                raise RuntimeError(
+                    f"Client ID tab did not open | {_screen_summary(page)}"
+                ) from exc
 
             # Step 2: Type Client ID sequentially
-            client_id_input = page.locator("input#fy_client_id:visible, input[name='fy_client_id']:visible, input[type='text']:visible").first
-            client_id_input.wait_for(state="visible", timeout=20000)
+            logger.info("[Auth] Step 2: entering Client ID")
+            client_id_input = page.locator("input#fy_client_id:visible, input[name='fy_client_id']:visible").first
             client_id_input.click()
             client_id_input.press_sequentially(self.fyers_id, delay=80)
             page.wait_for_timeout(500)
@@ -133,8 +223,15 @@ class FyersAuthManager:
             else:
                 submit_btn.click()
 
+            # Prove the Client ID was accepted: the next screen must
+            # mention TOTP/OTP. If Fyers stays on the login screen, stop
+            # here with that fact instead of typing the TOTP into the
+            # mobile-number field and stalling at the end.
+            _wait_for_text(page, r"TOTP|OTP|verification", "Client ID step", timeout_ms=15000)
+            _raise_if_error(page, "Client ID step")
+            logger.info("[Auth] Client ID accepted, OTP screen reached")
             # Step 3: Enter Fresh TOTP
-            page.wait_for_timeout(3500)
+            logger.info("[Auth] Step 3: entering TOTP")
             totp_switch = page.locator("text=/TOTP/i").first
             if totp_switch.count() > 0 and totp_switch.is_visible():
                 try:
@@ -164,8 +261,15 @@ class FyersAuthManager:
                 if submit_otp.count() > 0 and not submit_otp.is_disabled():
                     submit_otp.click()
 
+            # Prove the TOTP was accepted: the next screen must mention
+            # PIN. If Fyers rejects the TOTP it returns to the login /
+            # OTP screen, and the error check above names the reason.
+            _wait_for_text(page, r"PIN|auth_code=", "TOTP step", timeout_ms=15000)
+            _raise_if_error(page, "TOTP step")
+            logger.info("[Auth] TOTP accepted, PIN screen reached")
+
             # Step 4: Enter 4-Digit PIN
-            page.wait_for_timeout(3000)
+            logger.info("[Auth] Step 4: entering PIN")
             pin_inputs = page.locator("input:visible").all()
             if not pin_inputs:
                 screen_text = page.inner_text("body")[:180].replace("\n", " ")
@@ -194,9 +298,15 @@ class FyersAuthManager:
                 logger.warning("Timed out waiting for auth_code redirect: %s", exc)
                 curr_url = page.url
                 if "auth_code=" not in curr_url:
-                    screen_msg = page.inner_text("body")[:180].replace("\n", " ")
+                    _raise_if_error(page, "PIN step")
                     browser.close()
-                    raise RuntimeError(f"Stalled | Screen: {screen_msg}")
+                    raise RuntimeError(
+                        f"Stalled after PIN step, no auth_code redirect | {_screen_summary(page)}"
+                    ) from exc
+
+            final_url = page.url
+            browser.close()
+            logger.info("[Auth] Auth code received, exchanging for token")
 
             final_url = page.url
             browser.close()
