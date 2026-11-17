@@ -54,6 +54,7 @@ from advanced_auction_footprint_engine import AdvancedAuctionFootprintEngine
 from market_data import compute_gex_snapshot, get_option_quote
 from position_monitor import PositionMonitor
 from telegram_remote_controller import TelegramController
+from terminal_push import build_engine_payload, push_engine_snapshot
 
 try:
     from mtf_profile_context_builder import MTFProfileContextBuilder, ProfileLevels
@@ -413,6 +414,32 @@ def start_system():
             snapshot = get_gex_snapshot(spot)
             return float(snapshot.net_gex) if snapshot is not None else None
 
+        def _push_to_terminal(spot: float) -> None:
+            """Send this bar's Fyers snapshot to the Jev Terminal.
+
+            Silent no-op unless JEV_TERMINAL_URL is set. A failed push
+            never interrupts the run: it logs a warning and the terminal
+            keeps its last snapshot (its Yahoo fallback).
+            """
+            if not config.terminal_url:
+                return
+            try:
+                gex = get_gex_snapshot(spot)
+                payload = build_engine_payload(
+                    spot=spot, pdh=pdh, pdl=pdl, pdc=pdc,
+                    week_poc=levels.get("week_poc"),
+                    gex_snapshot=gex, expiry=expiry,
+                    bars=bars_5m_history, trading_date=get_ist_now().date(),
+                )
+                ok, err = push_engine_snapshot(
+                    config.terminal_url, config.terminal_token, payload)
+                if ok:
+                    logger.debug("Pushed engine snapshot to terminal (spot %s)", spot)
+                else:
+                    logger.warning("Terminal push failed: %s", err)
+            except Exception as exc:  # never break the live loop for the terminal
+                logger.warning("Terminal push failed: %s", exc)
+
         def finish_bar(fast_bar: FastBar):
             nonlocal bar_ticks, bar_start_time, early_triggered_this_bar
             bars_5m_history.append(fast_bar)
@@ -421,6 +448,7 @@ def start_system():
             bar_ticks.clear()
             bar_start_time = time.time()
             early_triggered_this_bar = False
+            _push_to_terminal(fast_bar.close)
 
         def _premium_levels(premium: float):
             sl = round(premium * SL_FRACTION, 2)
@@ -654,6 +682,9 @@ def start_system():
             on_message=on_message,
         )
         ws_holder["ws"] = ws
+        # First terminal push: seeded bars + last known spot, so the
+        # terminal shows Fyers data from the start of the session.
+        _push_to_terminal(bars_5m_history[-1].close if bars_5m_history else latest_ltp)
         _run_streaming_session(ws, shutdown_event, state_store)
 
     else:

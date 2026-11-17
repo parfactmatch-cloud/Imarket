@@ -662,7 +662,7 @@
       "price": 82104.79,
       "changePct": 0.63
     },
-    "source": "Yahoo Finance chart API (^NSEI, ^INDIAVIX, ^NSEBANK, ^BSESN)",
+    "feed": "snapshot",
     "asOf": "2026-11-16T14:36:55.038240+00:00",
     "chain": {
       "logDate": "2026-11-16",

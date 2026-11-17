@@ -157,5 +157,87 @@ class TestPlan(unittest.TestCase):
         self.assertIn("Paper mode", plan["riskRules"][0])
 
 
+class TestEngineSnapshot(unittest.TestCase):
+    def _base(self):
+        return {"spot": 25473.75, "change": 182.65, "changePct": 0.72,
+                "dayOpen": 25344.45, "dayHigh": 25496.65, "dayLow": 25303.65,
+                "tradingDate": "2026-11-17", "pdc": 25291.10,
+                "pdh": 25337.60, "pdl": 25172.10, "weekPoc": 25131.55,
+                "pocSource": "engine", "vah": 25400, "val": 25100,
+                "atmStrike": 25450, "expiryDate": "2026-11-17",
+                "bars": _bars([25350, 25400, 25450, 25473]),
+                "vix": {"price": 15.49, "changePct": -1.18},
+                "bankNifty": {"price": 62380.20, "changePct": 1.31},
+                "sensex": {"price": 82862.11, "changePct": 0.92},
+                "feed": "snapshot", "source": "old label that must be dropped",
+                "asOf": "2026-11-17T07:02:29+00:00",
+                "istTime": "12:32:29 IST", "marketStatus": "live"}
+
+    def _engine(self):
+        return {"spot": 25400.0, "asOf": "2026-11-17T08:05:00+00:00",
+                "tradingDate": "2026-11-17", "pdh": 25337.60,
+                "pdl": 25172.10, "pdc": 25291.10, "weekPoc": 25131.55,
+                "callWall": 26000, "putWall": 25000, "maxPain": 25200,
+                "pcr": 0.90, "expiryDate": "2026-11-17",
+                "bars": _bars([25380, 25400, 25410, 25400])}
+
+    def test_feed_is_fyers_and_no_vendor_source(self):
+        snap = jt.apply_engine_snapshot(
+            self._base(), self._engine(),
+            now=datetime(2026, 11, 17, 13, 35, tzinfo=jt.IST))
+        self.assertEqual(snap["feed"], "fyers")
+        self.assertNotIn("source", snap)
+        self.assertEqual(snap["spot"], 25400.0)
+        self.assertEqual(snap["weekPoc"], 25131.55)
+        self.assertEqual(snap["pocSource"], "engine")
+        self.assertEqual(snap["chain"]["callWall"], 26000)
+        self.assertEqual(snap["chain"]["maxPain"], 25200)
+
+    def test_greeks_recomputed_from_engine_spot(self):
+        snap = jt.apply_engine_snapshot(
+            self._base(), self._engine(),
+            now=datetime(2026, 11, 17, 13, 35, tzinfo=jt.IST))
+        self.assertEqual(snap["atmStrike"], 25400)
+        self.assertEqual(snap["change"], 108.90)
+        self.assertGreater(snap["greeks"]["cePremium"], 0)
+        self.assertGreater(snap["greeks"]["pePremium"], 0)
+
+    def test_engine_bars_replace_base_bars(self):
+        snap = jt.apply_engine_snapshot(
+            self._base(), self._engine(),
+            now=datetime(2026, 11, 17, 13, 35, tzinfo=jt.IST))
+        self.assertEqual([b["c"] for b in snap["bars"]],
+                         [25380, 25400, 25410, 25400])
+        self.assertEqual(snap["dayHigh"], 25415)
+
+    def test_engine_without_chain_fields_is_still_fyers(self):
+        engine = {"spot": 25400.0, "asOf": "2026-11-17T08:05:00+00:00",
+                  "tradingDate": "2026-11-17", "pdc": 25291.10,
+                  "expiryDate": "2026-11-17"}
+        snap = jt.apply_engine_snapshot(
+            self._base(), engine,
+            now=datetime(2026, 11, 17, 13, 35, tzinfo=jt.IST))
+        self.assertEqual(snap["feed"], "fyers")
+        self.assertNotIn("chain", snap)
+
+    def test_build_snapshot_feed_is_snapshot_not_yahoo(self):
+        import unittest.mock as mock
+
+        def fake_fetch(symbol, range_, interval):
+            return {"bars": _bars([25200, 25300, 25291]),
+                    "price": 25291.0, "previous_close": 25144.3}
+
+        def fake_quote(symbol):
+            return {"bars": _bars([15.0]), "price": 15.0,
+                    "previous_close": 15.5}
+
+        with mock.patch.object(jt, "fetch_quote", side_effect=fake_quote):
+            snap = jt.build_snapshot(
+                now=datetime(2026, 11, 16, 10, 30, tzinfo=jt.IST),
+                fetcher=fake_fetch)
+        self.assertEqual(snap["feed"], "snapshot")
+        self.assertNotIn("source", snap)
+
+
 if __name__ == "__main__":
     unittest.main()

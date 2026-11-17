@@ -358,6 +358,32 @@ def test_gex_snapshot_returns_walls():
     assert compute_dealer_net_dex(FakeChain(), 24000.0, date(2026, 11, 26)) == float(snap.net_gex)
 
 
+def test_gex_snapshot_returns_max_pain_and_pcr():
+    class FakeChain:
+        def optionchain(self, data):
+            rows = []
+            for strike, call_oi, put_oi in [
+                (23800, 1000, 6000),
+                (23900, 2000, 3000),
+                (24000, 3000, 2000),
+                (24100, 4000, 1000),
+                (24200, 5000, 500),
+            ]:
+                rows.append({
+                    "strike_price": strike,
+                    "call": {"oi": call_oi, "iv": 0.14, "ltp": 50.0},
+                    "put": {"oi": put_oi, "iv": 0.14, "ltp": 50.0},
+                })
+            return {"s": "ok", "data": {"optionsChain": rows}}
+
+    snap = compute_gex_snapshot(FakeChain(), 24000.0, date(2026, 11, 26))
+    assert snap is not None
+    # Max pain: total intrinsic payout is smallest at 24000 (600,000).
+    assert snap.max_pain == 24000
+    # PCR: total put OI 12,500 / total call OI 15,000 = 0.83.
+    assert snap.pcr == 0.83
+
+
 # ---------------------------------------------------------------- auth token expiry
 def _auth_manager(tmp_path, monkeypatch):
     monkeypatch.delenv("FYERS_ACCESS_TOKEN", raising=False)

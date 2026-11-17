@@ -12,19 +12,40 @@ sends no CORS headers, so a browser page cannot fetch `^NSEI` directly.
 This server fetches Yahoo server-side and serves the page + JSON to the
 browser. **Python standard library only — no dependencies to install.**
 
-## Honest limit
+## Data feed: Fyers engine feed, Yahoo snapshots as fallback
 
-This is **not tick-level real time**. It runs on Yahoo Finance snapshots,
-refreshed at most every 5 minutes during market hours (9:15–15:30 IST,
-weekdays), and the page says so in its header. The engine's real-time
-source is its Fyers WebSocket, whose token is minted fresh each morning
-inside GitHub Actions and expires daily — a web page cannot hold it.
+While the engine is running, it POSTs its live Fyers snapshot to the
+terminal once per 5-minute bar (and once at session start): spot,
+levels, chain walls, max pain, PCR, and the session's bars. The header
+then reads **"Fyers engine feed"**, and the spot, Greeks, scenarios and
+signal conditions are all recomputed from those numbers.
 
-Walls / PCR / max pain / Week POC come from the engine's own Telegram
-messages, logged into the terminal (see "Log the engine's levels"),
-not from a live chain feed. The dealer-gamma + CVD signal condition is
-engine-only and is marked as such on the page. True real-time would need
-the engine to push ticks to the terminal — not built.
+When the engine is not running — before 9:15, after close, or if a
+push fails — the page falls back to Yahoo Finance snapshots, refreshed
+at most every 5 minutes during market hours, and the header reads
+**"snapshot"**. No vendor name is shown for the fallback. This is
+**not tick-level real time** in either mode: the engine feed updates
+once per 5-minute bar, the Yahoo fallback on the same cadence. The
+dealer-gamma + CVD signal condition is engine-only and is marked as
+such on the page.
+
+### Wiring the engine feed (all three steps)
+
+1. **Render service:** set the env var `JEV_TERMINAL_TOKEN` to any long
+   random string. (Render redeploys when it changes.)
+2. **GitHub repo secrets:** `JEV_TERMINAL_URL` = the terminal's public
+   URL (e.g. `https://imarket-3.onrender.com`), and
+   `JEV_TERMINAL_TOKEN` = the same string as step 1.
+3. **Workflow:** `.github/workflows/jev_engine_workflow.yml` must pass
+   both through in its `env:` block (this file cannot be pushed by the
+   connector — edit it in GitHub):
+   ```yaml
+   JEV_TERMINAL_URL: ${{ secrets.JEV_TERMINAL_URL }}
+   JEV_TERMINAL_TOKEN: ${{ secrets.JEV_TERMINAL_TOKEN }}
+   ```
+The feed goes live on the next engine run after the merge. A failed
+push never interrupts the run — the engine logs a warning and the
+terminal keeps its last snapshot.
 
 ## Run it locally
 
@@ -63,14 +84,17 @@ PORT=8000 nohup python3 server.py &
 ```
 
 Railway sets `$PORT` for you; on a VPS, put it behind nginx/Caddy or
-run it with `systemd`. No secrets are needed — the terminal reads only
-public Yahoo data. Never put Fyers or Telegram credentials here.
+run it with `systemd`. The only secret is `JEV_TERMINAL_TOKEN` (the
+shared secret for the engine feed, above). Never put Fyers or Telegram
+credentials here.
 
-## Log the engine's levels (after the 9:15 run)
+## Log the engine's levels
 
-Each morning, after the engine's run, paste the Week POC from its
-System Online Telegram message and the call wall / put wall / max pain /
-PCR from its live chain into the **Log engine levels** panel on the page
+With the engine feed wired (above), the levels arrive by themselves:
+each push updates the logged Week POC, call/put walls, max pain and
+PCR for today. Manual logging is only a fallback — paste the Week POC
+from the run's System Online Telegram message and the walls from its
+live chain into the **Log engine levels** panel on the page
 (or `POST /api/chain`):
 
 ```bash
@@ -91,6 +115,7 @@ estimate) and re-judges the POC chop condition against it.
 | `GET /api/terminal` | Snapshot + chain + plan + events (what the page loads) |
 | `GET /api/plan` | Latest post-market plan |
 | `POST /api/chain` | Log the engine's levels for today |
+| `POST /api/engine` | Live feed push from the engine (needs `X-Jev-Token`) |
 | `POST /api/events` | Add an engine session-log entry `{kind, text}` |
 | `DELETE /api/events?id=N` | Delete one entry |
 | `POST /api/plan/build` | Rebuild the post-market plan from the latest snapshot |
@@ -119,27 +144,14 @@ State lives in JSON files under `terminal/data/` (or
   max 3 trades/day, max 1 open position, max daily loss ₹10,000,
   SL 50% / T1 150% / T2 200%, breakeven after T1, square-off 15:20 IST).
 
-## Known mismatch — engine expiry day (needs a separate fix)
-
-**The engine's `expiry.py` still computes the next Thursday as the
-weekly expiry. That is wrong now: NIFTY 50 weekly options expire every
-Tuesday on NSE since 1 Sep 2025 (SEBI/NSE schedule change; previously
-Thursday).** This terminal uses Tuesday — which is why its first version
-showed Tue 17 Nov 2026 as expiry, while the engine's run #46 reported
-Thu 19 Nov 2026. If the engine buys the Thursday series, it is buying a
-series that does not exist as a NIFTY weekly.
-
-This terminal PR deliberately does **not** change `expiry.py` — that is
-a trading-logic change and belongs in its own fix branch + PR, with a
-check against the live Fyers symbol master. Flagging it here so it is
-not lost.
-
 ## Tests
 
 ```bash
-python3 -m pytest terminal/tests/test_terminal.py
+python3 -m pytest terminal/tests/test_terminal.py terminal/tests/test_terminal_server.py
 # or: python3 -m unittest discover -s terminal/tests -v
 ```
 
 Tests are pure (no network): Greeks / put-call parity, Tuesday expiry,
-Yahoo parsing, levels, signal conditions, gamma-blast window, plan.
+Yahoo parsing, levels, signal conditions, gamma-blast window, plan,
+engine-feed overlay, and the `/api/engine` token check (localhost
+server only).

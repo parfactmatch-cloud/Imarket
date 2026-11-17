@@ -84,6 +84,11 @@ class JevConfig:
     # Tuesday expiry is a trading holiday. Empty means "compute it".
     expiry_override: str = ""
     log_level: str = "INFO"
+    # Jev Terminal live feed (optional): the engine POSTs its Fyers
+    # snapshot to the terminal once per 5-minute bar. Empty URL disables
+    # it. The token must match the terminal's JEV_TERMINAL_TOKEN env var.
+    terminal_url: str = ""
+    terminal_token: str = ""
 
     @classmethod
     def from_env(cls) -> "JevConfig":
@@ -98,4 +103,6 @@ class JevConfig:
             market_close_time=os.environ.get("MARKET_CLOSE_TIME", MARKET_CLOSE_TIME).strip(),
             expiry_override=os.environ.get("FYERS_EXPIRY_OVERRIDE", "").strip(),
             log_level=os.environ.get("LOG_LEVEL", "INFO").strip(),
+            terminal_url=os.environ.get("JEV_TERMINAL_URL", "").strip(),
+            terminal_token=os.environ.get("JEV_TERMINAL_TOKEN", "").strip(),
         )

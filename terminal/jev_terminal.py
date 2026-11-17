@@ -633,7 +633,7 @@ def build_snapshot(now: datetime | None = None,
         "sensex": {"price": round(sensex["price"], 2),
                    "changePct": round((sensex["price"] / sensex["previous_close"] - 1) * 100, 2)
                    if sensex.get("previous_close") else None},
-        "source": "Yahoo Finance chart API (^NSEI, ^INDIAVIX, ^NSEBANK, ^BSESN)",
+        "feed": "snapshot",
         "asOf": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -661,4 +661,116 @@ def apply_chain_to_snapshot(snapshot: dict, chain: dict | None) -> dict:
     snap["blast"] = gamma_blast_watch(snap["spot"], chain,
                                       date.fromisoformat(snap["expiryDate"]))
     snap["chain"] = chain
+    return snap
+
+
+def apply_engine_snapshot(base: dict, engine: dict,
+                          now: datetime | None = None) -> dict:
+    """Rebuild the snapshot from the engine's live Fyers feed.
+
+    ``base`` is the last Yahoo snapshot, kept only for India VIX / Bank
+    Nifty / Sensex, which the engine does not push. ``engine`` is the
+    record the engine POSTs to /api/engine once per 5-minute bar: spot,
+    levels, chain walls and the session's bars. Everything the page
+    judges from price — spot, change, day range, ATM Greeks, scenarios,
+    signal conditions, gamma-blast watch — is recomputed from the
+    engine's numbers, so the page never mixes a Fyers spot with Yahoo
+    Greeks. The weekly value area (VAH/VAL) stays from the base
+    snapshot's 5-day profile; the engine pushes no weekly profile.
+    Any stale vendor label on the base snapshot is dropped.
+    """
+    now_ist = (now or datetime.now(IST)).astimezone(IST)
+    snap = dict(base)
+    snap.pop("source", None)
+    spot = float(engine["spot"])
+    bars = engine.get("bars") or base.get("bars") or []
+    bars = [b for b in bars
+            if isinstance(b, dict) and b.get("c") is not None]
+    pdc = engine.get("pdc") or base.get("pdc") or spot
+    pdc = float(pdc)
+    change = spot - pdc
+    change_pct = (change / pdc * 100) if pdc else 0.0
+    day_open = bars[0]["o"] if bars else spot
+    day_high = max(b["h"] for b in bars) if bars else spot
+    day_low = min(b["l"] for b in bars) if bars else spot
+
+    chain = {k: engine.get(k) for k in
+             ("weekPoc", "callWall", "putWall", "pcr", "maxPain")}
+    chain = {k: v for k, v in chain.items() if v is not None}
+    # Levels: the engine's values win; the weekly profile still comes
+    # from the base snapshot's 5-day bars (see docstring).
+    levels = compute_levels(bars, [], bars, chain=chain or None)
+    if engine.get("pdh") is not None:
+        levels["pdh"] = float(engine["pdh"])
+    if engine.get("pdl") is not None:
+        levels["pdl"] = float(engine["pdl"])
+    levels["pdc"] = pdc
+    if engine.get("weekPoc") is not None:
+        levels["weekPoc"] = float(engine["weekPoc"])
+        levels["pocSource"] = "engine"
+    levels["vah"] = base.get("vah")
+    levels["val"] = base.get("val")
+
+    expiry = (date.fromisoformat(engine["expiryDate"])
+              if engine.get("expiryDate") else next_weekly_expiry(now_ist))
+    t_years = time_to_expiry_years(expiry, now_ist)
+    iv = 0.15
+    vix = base.get("vix") or {}
+    if vix.get("price"):
+        iv = float(vix["price"]) / 100.0
+    strike = atm_strike(spot)
+    greeks = black_scholes_greeks(spot, strike, t_years, iv)
+    scenarios = scenario_table(spot, strike, t_years, iv)
+    conditions, trend_dir, breakout = signal_conditions(spot, bars, levels, now_ist)
+    closes = [b["c"] for b in bars]
+    trend12 = (closes[-1] / closes[-12] - 1.0) * 100 if len(closes) >= 12 else 0.0
+    bar_start = now_ist.replace(second=0, microsecond=0) - timedelta(
+        minutes=now_ist.minute % 5, seconds=now_ist.second)
+    seconds_in = int((now_ist - bar_start).total_seconds())
+
+    snap.update({
+        "spot": round(spot, 2),
+        "change": round(change, 2),
+        "changePct": round(change_pct, 2),
+        "dayOpen": round(day_open, 2),
+        "dayHigh": round(day_high, 2),
+        "dayLow": round(day_low, 2),
+        "pdc": round(pdc, 2),
+        "pdh": round(levels["pdh"], 2) if levels["pdh"] else None,
+        "pdl": round(levels["pdl"], 2) if levels["pdl"] else None,
+        "weekPoc": levels["weekPoc"],
+        "vah": levels["vah"],
+        "val": levels["val"],
+        "pocSource": levels["pocSource"],
+        "atmStrike": strike,
+        "expiryDate": expiry.isoformat(),
+        "isExpiryDay": now_ist.date() == expiry,
+        "daysToExpiry": round((datetime.combine(expiry, time(15, 30), tzinfo=IST)
+                               - now_ist).total_seconds() / 86400, 1),
+        "greeks": greeks,
+        "scenarios": scenarios,
+        "bias": "bullish" if spot >= pdc else "bearish",
+        "trend12Pct": round(trend12, 2),
+        "trendDir": trend_dir,
+        "breakout": breakout,
+        "conditions": conditions,
+        "inPocChopZone": bool(levels["weekPoc"] and
+                              abs(spot - levels["weekPoc"]) / levels["weekPoc"]
+                              * 100 <= POC_CHOP_PCT),
+        "distToPoc": round(spot - levels["weekPoc"], 2) if levels["weekPoc"] else None,
+        "distToPocPct": round(abs(spot - levels["weekPoc"]) / levels["weekPoc"]
+                              * 100, 3) if levels["weekPoc"] else None,
+        "distToPdh": round(levels["pdh"] - spot, 2) if levels["pdh"] else None,
+        "distToPdl": round(spot - levels["pdl"], 2) if levels["pdl"] else None,
+        "barSecondsIn": seconds_in,
+        "marketStatus": market_status(now_ist),
+        "istTime": now_ist.strftime("%H:%M:%S IST"),
+        "bars": bars,
+        "feed": "fyers",
+        "engineAsOf": engine.get("asOf"),
+        "asOf": engine.get("asOf") or snap.get("asOf"),
+        "tradingDate": engine.get("tradingDate") or snap.get("tradingDate"),
+    })
+    if chain:
+        snap = apply_chain_to_snapshot(snap, chain)
     return snap
