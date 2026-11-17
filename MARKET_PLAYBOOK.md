@@ -93,6 +93,15 @@ Net dealer gamma (GEX) is the sum across the chain (**code**):
   Above it the market is pinned; below it the market is explosive
   (or the reverse, depending on the chain). Treat it as the line
   between the two regimes.
+- **Where the IV comes from:** the engine uses each option's IV from
+  the chain when the feed carries one. The live Fyers feed on 17 Nov
+  2026 carried none, which zeroed every gamma and the whole net GEX
+  reading (0.00 all day, flip just echoing the spot). Since then the
+  engine derives IV from each option's market price when the chain
+  omits it, falling back to 13% (recent India VIX) only when there is
+  no price either, and it logs how many legs used each source. A net
+  GEX of exactly 0.00 on a real chain is treated as unavailable — the
+  engine HOLDs — instead of reporting a regime off a zero.
 
 **How to play through a wall:**
 
