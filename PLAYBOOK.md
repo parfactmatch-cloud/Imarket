@@ -44,18 +44,24 @@ trades with real money unless you explicitly set `PAPER_MODE=False`.
 
 ## Alert decoder — what each message means, and what to do
 
+Every alert is now a card: an icon for its type, a monospace block of
+aligned rows, and a footer with the IST time it was sent. The footer time
+is what tells two identical-looking startups apart — two "System Online"
+messages on one day show different times. Every card shows the live Fyers
+value at the moment it was sent, so no two cards carry the same stale feed.
+
 | Alert | Meaning | Action |
 | --- | --- | --- |
-| **System Online (Live Feed)** | Token secured, levels fetched, live scanning. | None. This is the good one. |
+| **System Online (Live Feed)** | Token secured, levels fetched, live scanning. Shows prev close, PDH/PDL, Week POC and expiry. | None. This is the good one. |
 | **System Online (No Live Token)** | Auth failed. Engine is idle: **no signals, no trades.** | Read the **Auth Error** alert that came with it and use the table below. Do not assume it traded. |
 | **Auth Error — Token generation failed: …** | Login failed at a named step. | See "Auth failures" below. The step name tells you exactly where. |
 | **Levels Unavailable — Trading Paused** | Real levels could not be fetched. Engine paused itself rather than trade on stale defaults. | None today. Check the next run; do not force a trade. |
-| **NIFTY BUY / SELL SIGNAL** | All five conditions + gamma confirmed; an order was placed (paper). | Check the **Position Update** that follows. |
+| **NIFTY BUY / SELL SIGNAL** | All five conditions + gamma confirmed; an order was placed (paper). Shows spot, premium, SL/T1/T2, walls and Week POC. | Check the **Position Update** that follows. |
 | **Order Rejected: …** | The router refused the order; the reason is in the message (usually a risk limit). | Read the reason. If it is a risk limit, that is the system working. |
 | **Quote Unavailable** | No live quote for the option symbol; trade skipped. | None. It will try again on the next signal. |
 | **Position Update** | An exit fired: stop-loss, target 1, target 2, or breakeven move. | None, unless the action reads FAILED — then check the run log. |
 | **End-of-Day Square-Off** | 15:20 IST close-out. | None. |
-| **Session Closed** | Market closed 3:30 PM IST. Final spot + session CVD. | None. Day is done. |
+| **Session Closed** | Market closed 3:30 PM IST. Final spot + session CVD, in the card. | None. Day is done. |
 | **System Shutdown** | Engine manually terminated. | Only appears if someone stopped it. |
 
 ## Auth failures — step by step

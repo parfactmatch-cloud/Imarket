@@ -460,35 +460,40 @@ def test_historical_levels_failure_is_not_ok(monkeypatch):
 def test_signal_alert_shows_sl_t1_t2():
     import main_jev_orchestrator as orch
 
-    text = orch._signal_alert_details(
+    rows = dict(orch._signal_alert_details(
         spot=25180, imb_tag="Stacked Buy: 3 lvls", ctx_tag="IMBALANCE_BULLISH",
         bar_delta=12400, strike=25200, option_type="CE", premium=68,
-        expiry=date(2026, 11, 17), sl=34.0, t1=102.0, t2=136.0, qty=75)
-    assert "SL: 34.0 | T1: 102.0 | T2: 136.0 | Qty: 75" in text
-    assert "Strike: NIFTY 25200 CE | Premium: 68" in text
-    assert "Spot: 25180 | Stacked Buy: 3 lvls" in text
-    assert "Expiry: 2026-11-17" in text
+        expiry=date(2026, 11, 17), sl=34.0, t1=102.0, t2=136.0, qty=75))
+    assert rows["SL / T1 / T2"] == "₹34.00 / ₹102.00 / ₹136.00"
+    assert rows["Qty"] == "75 (1 lot)"
+    assert rows["Strike"] == "NIFTY 25200 CE"
+    assert rows["Premium"] == "₹68.00"
+    assert rows["NIFTY Spot"] == "25,180.00"
+    assert rows["Setup"] == "Stacked Buy: 3 lvls"
+    assert rows["Expiry"] == "Tue 17 Nov 2026"
 
 
 def test_signal_alert_shows_walls_and_poc():
     import main_jev_orchestrator as orch
 
-    text = orch._signal_alert_details(
+    rows = dict(orch._signal_alert_details(
         spot=25180, imb_tag="Stacked Buy: 3 lvls", ctx_tag="IMBALANCE_BULLISH",
         bar_delta=12400, strike=25200, option_type="CE", premium=68,
         expiry=date(2026, 11, 19), sl=34.0, t1=102.0, t2=136.0, qty=75,
-        call_wall=25300.0, put_wall=25000.0, week_poc=25131.55)
-    assert "Walls: C 25300 / P 25000 | Week POC: 25131.55" in text
+        call_wall=25300.0, put_wall=25000.0, week_poc=25131.55))
+    assert rows["Walls"] == "C 25300 / P 25000"
+    assert rows["Week POC"] == "25131.55"
 
 
 def test_signal_alert_shows_na_without_walls():
     import main_jev_orchestrator as orch
 
-    text = orch._signal_alert_details(
+    rows = dict(orch._signal_alert_details(
         spot=25180, imb_tag="CVD Confirmed", ctx_tag="BREAKOUT",
         bar_delta=100, strike=25200, option_type="CE", premium=68,
-        expiry=date(2026, 11, 19), sl=34.0, t1=102.0, t2=136.0, qty=75)
-    assert "Walls: C n/a / P n/a | Week POC: n/a" in text
+        expiry=date(2026, 11, 19), sl=34.0, t1=102.0, t2=136.0, qty=75))
+    assert rows["Walls"] == "C n/a / P n/a"
+    assert rows["Week POC"] == "n/a"
 
 
 # ---------------------------------------------------------------- Fyers API login (no browser)
