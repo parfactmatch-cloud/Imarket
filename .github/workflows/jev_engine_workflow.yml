@@ -37,5 +37,7 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           PAPER_MODE: "True"
+          JEV_TERMINAL_URL: ${{ secrets.JEV_TERMINAL_URL }}
+          JEV_TERMINAL_TOKEN: ${{ secrets.JEV_TERMINAL_TOKEN }}
         run: |
           python main_jev_orchestrator.py
