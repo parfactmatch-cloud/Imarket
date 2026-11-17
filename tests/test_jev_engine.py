@@ -6,6 +6,8 @@ is monkeypatched.
 """
 
 import json
+import threading
+import time
 from datetime import date, datetime, timedelta, timezone
 
 import pytest
@@ -569,3 +571,129 @@ def test_request_key_missing_is_an_error():
     with pytest.raises(RuntimeError, match="no request_key"):
         _request_key({"s": "ok"}, "TOTP step")
     assert _request_key({"data": {"request_key": "rk"}}, "TOTP step") == "rk"
+
+
+# ---------------------------------------------------------------- shutdown / streaming session
+class _FakeSocket:
+    """Stand-in for fyers_apiv3's FyersDataSocket: connect() returns at once."""
+
+    def __init__(self):
+        self.connect_calls = 0
+        self.close_connection_calls = 0
+        self.close_calls = 0
+        self.background_flag = False
+
+    def connect(self):
+        self.connect_calls += 1
+
+    def close_connection(self):
+        self.close_connection_calls += 1
+
+    def close(self):
+        self.close_calls += 1
+
+
+class _FakeStore:
+    def __init__(self):
+        self.closed = False
+        self.close_calls = 0
+
+    def close(self):
+        self.closed = True
+        self.close_calls += 1
+
+
+def test_wait_for_shutdown_returns_once_event_set():
+    import main_jev_orchestrator as orch
+
+    event = threading.Event()
+    event.set()
+    orch._wait_for_shutdown(event, poll_seconds=0.01)  # returns at once
+
+
+def test_wait_for_shutdown_blocks_until_event_set():
+    import main_jev_orchestrator as orch
+
+    event = threading.Event()
+    threading.Timer(0.2, event.set).start()
+    start = time.monotonic()
+    orch._wait_for_shutdown(event, poll_seconds=0.05)
+    assert time.monotonic() - start >= 0.15
+
+
+def test_close_fyers_socket_uses_close_connection():
+    import main_jev_orchestrator as orch
+
+    ws = _FakeSocket()
+    orch._close_fyers_socket(ws)
+    assert ws.close_connection_calls == 1
+    assert ws.close_calls == 0  # the old no-op lookup must not be the path
+
+
+def test_close_fyers_socket_falls_back_to_close():
+    import main_jev_orchestrator as orch
+
+    class _CloseOnly:
+        def __init__(self):
+            self.close_calls = 0
+
+        def close(self):
+            self.close_calls += 1
+
+    ws = _CloseOnly()
+    orch._close_fyers_socket(ws)
+    assert ws.close_calls == 1
+
+
+def test_close_fyers_socket_never_raises():
+    import main_jev_orchestrator as orch
+
+    orch._close_fyers_socket(None)
+
+    class _Boom:
+        def close_connection(self):
+            raise RuntimeError("boom")
+
+    orch._close_fyers_socket(_Boom())  # warning logged, no raise
+
+
+def test_streaming_session_stays_alive_until_shutdown():
+    """Regression test for run #49: connect() returns at once, so the old
+    code closed the state store about a second after starting while the
+    socket thread kept hitting the closed DB — and the job then ran to
+    GitHub's 6-hour timeout. The session must stay open until shutdown."""
+    import main_jev_orchestrator as orch
+
+    ws = _FakeSocket()
+    store = _FakeStore()
+    event = threading.Event()
+    threading.Timer(0.2, event.set).start()
+
+    orch._run_streaming_session(ws, event, store)
+
+    assert ws.connect_calls == 1
+    assert ws.background_flag is True  # socket thread is a daemon
+    assert store.close_calls == 1
+    assert store.closed
+
+
+def test_streaming_session_does_not_close_store_early():
+    import main_jev_orchestrator as orch
+
+    ws = _FakeSocket()
+    store = _FakeStore()
+    event = threading.Event()
+    threading.Timer(0.3, event.set).start()
+    result = {}
+
+    def run():
+        orch._run_streaming_session(ws, event, store)
+        result["done"] = True
+
+    t = threading.Thread(target=run)
+    t.start()
+    time.sleep(0.15)
+    assert store.close_calls == 0  # still running: the store must stay open
+    t.join(timeout=5)
+    assert result.get("done") is True
+    assert store.close_calls == 1

@@ -213,6 +213,62 @@ def fetch_5m_history(fyers_client):
     return bars
 
 
+def _wait_for_shutdown(shutdown_event, poll_seconds=5):
+    """Block until the market-close watcher signals shutdown.
+
+    ``FyersDataSocket.connect()`` returns immediately after spawning the
+    socket thread, so without this wait the main thread falls through to
+    the ``finally`` that closes the state store — about a second after
+    starting — while ticks are still arriving. Waiting here keeps the
+    session (and the database) alive until 15:30 IST.
+    """
+    while not shutdown_event.is_set():
+        shutdown_event.wait(poll_seconds)
+
+
+def _close_fyers_socket(ws):
+    """Close a FyersDataSocket with the method fyers-apiv3 actually has.
+
+    The socket has no ``close`` method — its shutdown method is
+    ``close_connection`` (fyers-apiv3 3.2.1), which closes the WebSocket,
+    joins the socket/message/ping threads and stops the keep-alive loop.
+    The old code looked up ``close``, found nothing, and silently closed
+    nothing, so the job never exited. Falls back to ``close`` for other
+    socket objects, and never raises.
+    """
+    if ws is None:
+        return
+    for name in ("close_connection", "close"):
+        close_fn = getattr(ws, name, None)
+        if callable(close_fn):
+            try:
+                close_fn()
+            except Exception as exc:
+                logger.warning("WebSocket close failed: %s", exc)
+            return
+
+
+def _run_streaming_session(ws, shutdown_event, state_store):
+    """Run the live socket session until the close watcher shuts it down.
+
+    ``connect()`` spawns the socket thread and returns at once; the wait
+    below is what keeps the process (and the state store) alive for the
+    session instead of ending about a second after starting.
+    """
+    # The SDK only marks its socket thread a daemon when write_to_file is
+    # set, which we do not use — so mark it daemon here. Then the process
+    # can exit even if the socket's own close ever fails to stop it.
+    ws.background_flag = True
+    try:
+        ws.connect()
+        _wait_for_shutdown(shutdown_event)
+    finally:
+        # Graceful shutdown: flush/close the DB instead of os._exit(0).
+        shutdown_event.set()
+        state_store.close()
+        logger.info(">>> Jev Engine lifecycle finished.")
+
+
 def start_system():
     config = JevConfig.from_env()
     setup_logging(config.log_level)
@@ -544,19 +600,23 @@ def start_system():
                         f"Market closed at 3:30 PM IST.\nFinal Nifty Spot: {latest_ltp} | "
                         f"Session CVD: {fp_engine.running_cvd}",
                     )
-                    shutdown_event.set()
+                    # Close the socket BEFORE signalling shutdown: no more
+                    # ticks may arrive once the main thread closes the
+                    # state store. (The old code set the event first and
+                    # then called ws.close(), which does not exist on
+                    # FyersDataSocket, so the database was closed under a
+                    # live socket and nothing ever shut the job down.)
+                    try:
+                        _close_fyers_socket(ws_holder["ws"])
+                    finally:
+                        shutdown_event.set()
                     break
                 shutdown_event.wait(30)
-            # Graceful shutdown: ask the socket to close, then the
-            # main thread closes the state store below.
-            ws = ws_holder["ws"]
-            if ws is not None:
-                close_fn = getattr(ws, "close", None)
-                if callable(close_fn):
-                    try:
-                        close_fn()
-                    except Exception as exc:
-                        logger.warning("WebSocket close failed: %s", exc)
+            # If the loop ended without the close block above (shutdown was
+            # requested another way), still try to close the socket. A
+            # second close is a no-op: close_connection returns at once
+            # once the socket is already closed.
+            _close_fyers_socket(ws_holder["ws"])
 
         threading.Thread(target=market_close_watcher, daemon=True).start()
 
@@ -573,13 +633,7 @@ def start_system():
             on_message=on_message,
         )
         ws_holder["ws"] = ws
-        try:
-            ws.connect()
-        finally:
-            # Graceful shutdown: flush/close the DB instead of os._exit(0).
-            shutdown_event.set()
-            state_store.close()
-            logger.info(">>> Jev Engine lifecycle finished.")
+        _run_streaming_session(ws, shutdown_event, state_store)
 
     else:
         # No live token: do NOT trade. The old fallback loop ran mock
