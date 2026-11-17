@@ -248,6 +248,16 @@ def _close_fyers_socket(ws):
             return
 
 
+def _is_closed_database_error(msg):
+    """True when a socket error means the state store is already closed.
+
+    sqlite3 raises "Cannot operate on a closed database" when a tick
+    arrives after the store was closed. Nothing can be salvaged from that
+    session, so the caller shuts down instead of looping on it.
+    """
+    return "closed database" in str(msg).lower()
+
+
 def _run_streaming_session(ws, shutdown_event, state_store):
     """Run the live socket session until the close watcher shuts it down.
 
@@ -263,6 +273,11 @@ def _run_streaming_session(ws, shutdown_event, state_store):
         ws.connect()
         _wait_for_shutdown(shutdown_event)
     finally:
+        # Close the socket first so no more ticks arrive, then the store.
+        # (The close watcher does the same at 15:30 IST; this covers a
+        # shutdown triggered another way, e.g. the closed-database guard
+        # in on_error. A second close is a no-op.)
+        _close_fyers_socket(ws)
         # Graceful shutdown: flush/close the DB instead of os._exit(0).
         shutdown_event.set()
         state_store.close()
@@ -563,6 +578,12 @@ def start_system():
 
         def on_error(msg):
             logger.error("[WS Error] %s", msg)
+            # A closed database means the session is already over — the
+            # store is only closed at shutdown. Stop here instead of
+            # logging the same error forever: run #49 looped this
+            # ~3x/second until GitHub's 6-hour timeout.
+            if _is_closed_database_error(msg):
+                shutdown_event.set()
 
         def on_close(msg):
             logger.info("[WS Closed] %s", msg)

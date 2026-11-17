@@ -673,8 +673,40 @@ def test_streaming_session_stays_alive_until_shutdown():
 
     assert ws.connect_calls == 1
     assert ws.background_flag is True  # socket thread is a daemon
+    assert ws.close_connection_calls == 1  # socket closed before the store
     assert store.close_calls == 1
     assert store.closed
+
+
+def test_is_closed_database_error():
+    import main_jev_orchestrator as orch
+
+    assert orch._is_closed_database_error("Cannot operate on a closed database.")
+    assert orch._is_closed_database_error("CAN'T OPERATE ON A CLOSED DATABASE")
+    assert not orch._is_closed_database_error("connection reset by peer")
+    assert not orch._is_closed_database_error("")
+    assert not orch._is_closed_database_error(None)
+
+
+def test_streaming_session_closes_socket_before_store():
+    import main_jev_orchestrator as orch
+
+    order = []
+
+    class _OrderSocket(_FakeSocket):
+        def close_connection(self):
+            order.append("socket")
+            super().close_connection()
+
+    class _OrderStore(_FakeStore):
+        def close(self):
+            order.append("store")
+            super().close()
+
+    event = threading.Event()
+    event.set()
+    orch._run_streaming_session(_OrderSocket(), event, _OrderStore())
+    assert order == ["socket", "store"]
 
 
 def test_streaming_session_does_not_close_store_early():
