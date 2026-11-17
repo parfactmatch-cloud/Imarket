@@ -4,10 +4,13 @@ Institutional Dealer Positioning & Gamma Exposure (GEX) Engine
 Designed for NIFTY 50, FINNIFTY, and SENSEX.
 """
 
+import logging
 import math
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -38,11 +41,16 @@ class GEXSnapshot:
 
 
 class IndiaGEXEngine:
-    def __init__(self, risk_free_rate: float = 0.07):
+    def __init__(self, risk_free_rate: float = 0.07, fallback_iv: float = 0.13):
         """
         risk_free_rate: 7.0% default (RBI 91-Day T-Bill benchmark)
+        fallback_iv: IV used only when a chain row carries neither a usable
+            IV nor a market price to derive one from (recent India VIX
+            level, ~13%). A live VIX quote would replace it; it is never
+            used silently -- see the IV summary logged by process_chain.
         """
         self.r = risk_free_rate
+        self.fallback_iv = fallback_iv
         self.lot_sizes = {
             "NIFTY": 75,
             "FINNIFTY": 65,
@@ -64,6 +72,64 @@ class IndiaGEXEngine:
         gamma = self._norm_pdf(d1) / (spot * iv * math.sqrt(tte_years))
         return gamma
 
+    @staticmethod
+    def _norm_cdf(x: float) -> float:
+        return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+    def _bs_price(self, spot: float, strike: float, tte_years: float, iv: float, is_call: bool) -> float:
+        """Black-Scholes price of a European option (same conventions as gamma)."""
+        if spot <= 0 or strike <= 0 or tte_years <= 0 or iv <= 0:
+            return 0.0
+        d1 = (math.log(spot / strike) + (self.r + 0.5 * iv ** 2) * tte_years) / (iv * math.sqrt(tte_years))
+        d2 = d1 - iv * math.sqrt(tte_years)
+        disc = math.exp(-self.r * tte_years)
+        if is_call:
+            return spot * self._norm_cdf(d1) - strike * disc * self._norm_cdf(d2)
+        return strike * disc * self._norm_cdf(-d2) - spot * self._norm_cdf(-d1)
+
+    def implied_vol_from_price(self, spot: float, strike: float, tte_years: float,
+                               price: float, is_call: bool) -> Optional[float]:
+        """IV implied by an option's market price, or None if it cannot be found.
+
+        Bisection on IV: the Black-Scholes price rises monotonically with IV.
+        Returns None when the price carries no time value (at/below intrinsic,
+        or zero/missing), so the caller can fall back to the configured
+        fallback IV instead of silently pricing gamma at zero.
+        """
+        if spot <= 0 or strike <= 0 or tte_years <= 0 or price is None or price <= 0:
+            return None
+        intrinsic = max(0.0, spot - strike) if is_call else max(0.0, strike - spot)
+        if price <= intrinsic:
+            return None
+        lo, hi = 0.001, 5.0
+        if self._bs_price(spot, strike, tte_years, hi, is_call) < price:
+            return None  # even 500% IV cannot reach this price
+        for _ in range(60):
+            mid = 0.5 * (lo + hi)
+            if self._bs_price(spot, strike, tte_years, mid, is_call) < price:
+                lo = mid
+            else:
+                hi = mid
+        return 0.5 * (lo + hi)
+
+    def _resolve_iv(self, spot: float, strike: float, tte_years: float,
+                    iv: float, ltp: float, is_call: bool) -> Tuple[float, str]:
+        """IV for one option, plus where it came from: "chain", "ltp" or
+        "fallback".
+
+        The chain's own IV when present; else the IV implied by its market
+        price; else the configured fallback IV. The live Fyers chain on
+        17 Nov 2026 carried no usable IV on any strike, which zeroed every
+        gamma and the whole net GEX reading. Deriving IV from the price
+        the chain does carry keeps gamma real.
+        """
+        if iv is not None and iv > 0.001:
+            return iv, "chain"
+        derived = self.implied_vol_from_price(spot, strike, tte_years, ltp, is_call)
+        if derived is not None:
+            return derived, "ltp"
+        return self.fallback_iv, "fallback"
+
     def process_chain(
         self,
         underlying: str,
@@ -80,9 +146,17 @@ class IndiaGEXEngine:
         call_ois = []
         put_ois = []
 
+        iv_sources = {"chain": 0, "ltp": 0, "fallback": 0}
+
         for data in chain:
-            c_gamma = self.calculate_bs_gamma(spot_price, data.strike, tte_years, data.call_iv)
-            p_gamma = self.calculate_bs_gamma(spot_price, data.strike, tte_years, data.put_iv)
+            call_iv, call_src = self._resolve_iv(spot_price, data.strike, tte_years,
+                                                 data.call_iv, data.call_ltp, is_call=True)
+            put_iv, put_src = self._resolve_iv(spot_price, data.strike, tte_years,
+                                               data.put_iv, data.put_ltp, is_call=False)
+            iv_sources[call_src] += 1
+            iv_sources[put_src] += 1
+            c_gamma = self.calculate_bs_gamma(spot_price, data.strike, tte_years, call_iv)
+            p_gamma = self.calculate_bs_gamma(spot_price, data.strike, tte_years, put_iv)
 
             # Cash-Normalized Dealer Gamma (1% move impact)
             # Call side: Retail Buy -> Dealer Short Gamma (-1)
@@ -101,6 +175,15 @@ class IndiaGEXEngine:
         total_call_gex = float(np.sum(call_gex_per_strike))
         total_put_gex = float(np.sum(put_gex_per_strike))
         aggregate_net_gex = total_call_gex + total_put_gex
+
+        if iv_sources["chain"] < len(chain) * 2:
+            # Any leg not from the chain means the feed is omitting IV --
+            # say so once per snapshot instead of silently trusting it.
+            logger.info(
+                "GEX IV: %d/%d legs from chain, %d derived from LTP, "
+                "%d on fallback IV %.2f",
+                iv_sources["chain"], len(chain) * 2, iv_sources["ltp"],
+                iv_sources["fallback"], self.fallback_iv)
 
         call_wall = strikes[int(np.argmax(call_ois))] if call_ois else spot_price
         put_wall = strikes[int(np.argmax(put_ois))] if put_ois else spot_price

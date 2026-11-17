@@ -29,6 +29,26 @@ from india_gex_engine import GEXSnapshot, IndiaGEXEngine, OptionStrikeData
 
 logger = logging.getLogger(__name__)
 
+_CHAIN_SHAPE_LOGGED = False
+
+
+def _log_chain_shape_once(rows) -> None:
+    """Log the raw chain's field names once per process (keys only, no values).
+
+    This is how the next run proves which fields Fyers actually sends -- the
+    17 Nov 2026 zero-GEX day was caused by an IV field the parser expected
+    but the feed did not carry.
+    """
+    global _CHAIN_SHAPE_LOGGED
+    if _CHAIN_SHAPE_LOGGED or not isinstance(rows, list) or not rows:
+        return
+    _CHAIN_SHAPE_LOGGED = True
+    first = rows[0] if isinstance(rows[0], dict) else {}
+    call = first.get("call") if isinstance(first.get("call"), dict) else {}
+    put = first.get("put") if isinstance(first.get("put"), dict) else {}
+    logger.info("Option chain shape: %d rows; row keys=%s; call keys=%s; put keys=%s",
+                len(rows), sorted(first.keys()), sorted(call.keys()), sorted(put.keys()))
+
 
 def _extract_ltp(payload) -> Optional[float]:
     """Extract an LTP from the several shapes Fyers quotes can take."""
@@ -131,6 +151,7 @@ def fetch_option_chain(fyers_client, symbol: str = "NSE:NIFTY50-INDEX") -> Optio
     rows = None
     if isinstance(data, dict):
         rows = data.get("optionsChain") or data.get("optionChain") or data.get("chain")
+    _log_chain_shape_once(rows)
     if not isinstance(rows, list) or len(rows) < 5:
         logger.warning("Option chain unusable (rows=%s); GEX unavailable",
                        len(rows) if isinstance(rows, list) else rows)
@@ -172,6 +193,19 @@ def compute_gex_snapshot(
         return None
     logger.info("GEX net_dex=%.2f regime=%s flip=%.2f",
                 snapshot.net_gex, snapshot.market_regime, snapshot.gamma_flip_level)
+    if snapshot.net_gex == 0.0:
+        # A real chain never nets to exactly zero: with real open interest
+        # the call/put gammas cannot cancel to the paise. Zero means the
+        # chain carried no usable gamma (no IV and no price to derive it
+        # from, or no open interest at all). Report it as unavailable --
+        # the engine HOLDs -- rather than a regime and flip the engine
+        # would trade on.
+        total_oi = sum(d.call_oi + d.put_oi for d in chain)
+        logger.warning(
+            "GEX is zero on a %d-strike chain (total OI %d); treating "
+            "dealer gamma as unavailable -- no signal on GEX",
+            len(chain), total_oi)
+        return None
     return snapshot
 
 
