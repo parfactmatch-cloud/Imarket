@@ -33,6 +33,8 @@ class GEXSnapshot:
     gamma_flip_level: float  # Estimated Spot level where Net GEX crosses zero
     market_regime: str    # "LONG_GAMMA_SUPPRESSION" or "SHORT_GAMMA_EXPANSION"
     zero_dte_squeeze_risk: bool
+    max_pain: float = 0.0     # Strike minimising total option payout at expiry
+    pcr: float = 0.0          # Total put OI / total call OI
 
 
 class IndiaGEXEngine:
@@ -106,6 +108,11 @@ class IndiaGEXEngine:
         gamma_flip = self._find_gamma_flip(strikes, net_gex_per_strike, spot_price)
         regime = "LONG_GAMMA_SUPPRESSION" if aggregate_net_gex > 0 else "SHORT_GAMMA_EXPANSION"
 
+        total_call_oi = float(sum(call_ois))
+        total_put_oi = float(sum(put_ois))
+        pcr = (total_put_oi / total_call_oi) if total_call_oi > 0 else 0.0
+        max_pain = self._max_pain_strike(strikes, call_ois, put_ois)
+
         hours_to_expiry = tte_years * 252 * 6.25
         dist_to_call_wall = abs(spot_price - call_wall) / spot_price if spot_price > 0 else 0
         dist_to_put_wall = abs(spot_price - put_wall) / spot_price if spot_price > 0 else 0
@@ -121,8 +128,31 @@ class IndiaGEXEngine:
             put_wall=put_wall,
             gamma_flip_level=round(gamma_flip, 2),
             market_regime=regime,
-            zero_dte_squeeze_risk=is_0dte_squeeze
+            zero_dte_squeeze_risk=is_0dte_squeeze,
+            max_pain=round(max_pain, 2),
+            pcr=round(pcr, 2),
         )
+
+    @staticmethod
+    def _max_pain_strike(strikes: List[float], call_ois: List[int],
+                         put_ois: List[int]) -> float:
+        """Strike where the total intrinsic payout at expiry is smallest.
+
+        For each candidate expiry price S (each listed strike), the payout
+        is sum over calls of max(0, S-K) * call_oi plus sum over puts of
+        max(0, K-S) * put_oi. The strike minimising it is max pain.
+        """
+        if not strikes:
+            return 0.0
+        best_strike, best_payout = strikes[0], None
+        for s in strikes:
+            payout = sum(max(0.0, s - k) * oi
+                         for k, oi in zip(strikes, call_ois))
+            payout += sum(max(0.0, k - s) * oi
+                          for k, oi in zip(strikes, put_ois))
+            if best_payout is None or payout < best_payout:
+                best_strike, best_payout = s, payout
+        return float(best_strike)
 
     def _find_gamma_flip(self, strikes: List[float], net_gex: List[float], spot: float) -> float:
         if not net_gex or not strikes:

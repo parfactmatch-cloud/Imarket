@@ -20,6 +20,16 @@ Endpoints:
                             {weekPoc, callWall, putWall, pcr, maxPain}
                             (from the 9:15 run's System Online message and
                             its live chain — nothing here is guessed)
+    POST /api/engine        live feed from the running engine (token):
+                            {spot, asOf, tradingDate, pdh, pdl, pdc,
+                             weekPoc, callWall, putWall, maxPain, pcr,
+                             gammaFlip, regime, expiryDate, bars}
+                            While a push is fresh (under 10 minutes old)
+                            the page shows it as the Fyers engine feed;
+                            otherwise it falls back to Yahoo snapshots.
+                            Requires the X-Jev-Token header matching the
+                            JEV_TERMINAL_TOKEN env var; without that env
+                            var the endpoint is disabled.
     POST /api/events        add an engine session-log entry
                             {kind, text}  kind: online|signal|position|squareoff|closed|note
     DELETE /api/events?id=  delete one entry
@@ -36,6 +46,7 @@ itself is never modified.
 
 from __future__ import annotations
 
+import hmac
 import json
 import os
 import threading
@@ -58,8 +69,15 @@ SNAPSHOT_FILE = DATA_DIR / "snapshot.json"
 PLAN_FILE = DATA_DIR / "plan.json"
 CHAIN_FILE = DATA_DIR / "chain.json"
 EVENTS_FILE = DATA_DIR / "events.json"
+ENGINE_FILE = DATA_DIR / "engine.json"
+
+# Shared secret for the engine feed: the engine sends it as the
+# X-Jev-Token header. Set the same value as the JEV_TERMINAL_TOKEN env
+# var on the Render service and as the repo secret of the same name.
+JEV_TERMINAL_TOKEN = os.environ.get("JEV_TERMINAL_TOKEN", "").strip()
 
 REFRESH_SECONDS = 300  # Yahoo snapshots, at most every 5 minutes
+ENGINE_FRESH_SECONDS = 600  # engine push, at most every 10 minutes
 _lock = threading.Lock()
 
 
@@ -86,7 +104,7 @@ def _seed() -> dict:
 
 
 def _load_state() -> dict:
-    """snapshot / plan / chain / events, falling back to the seed."""
+    """snapshot / plan / chain / events / engine, falling back to the seed."""
     seed = _seed()
     snapshot = _read_json(SNAPSHOT_FILE) or seed.get("snapshot")
     plan = _read_json(PLAN_FILE) or seed.get("plan")
@@ -94,28 +112,60 @@ def _load_state() -> dict:
     events = _read_json(EVENTS_FILE)
     if events is None:
         events = seed.get("events") or []
-    return {"snapshot": snapshot, "plan": plan, "chain": chain, "events": events}
+    engine = _read_json(ENGINE_FILE)
+    return {"snapshot": snapshot, "plan": plan, "chain": chain,
+            "events": events, "engine": engine}
+
+
+def _age_seconds(iso_value) -> float | None:
+    if not iso_value:
+        return None
+    try:
+        moment = datetime.fromisoformat(iso_value)
+    except ValueError:
+        return None
+    return (datetime.now(timezone.utc) - moment).total_seconds()
 
 
 def _snapshot_age_seconds(snapshot: dict | None) -> float | None:
-    if not snapshot or not snapshot.get("asOf"):
+    if not snapshot:
         return None
-    try:
-        as_of = datetime.fromisoformat(snapshot["asOf"])
-    except ValueError:
-        return None
-    return (datetime.now(timezone.utc) - as_of).total_seconds()
+    return _age_seconds(snapshot.get("asOf"))
+
+
+def _engine_is_fresh(engine: dict | None) -> bool:
+    """True when the engine pushed a spot within the freshness window."""
+    if not engine or engine.get("spot") is None:
+        return False
+    age = _age_seconds(engine.get("receivedAt"))
+    return age is not None and age < ENGINE_FRESH_SECONDS
 
 
 def refresh_snapshot(force: bool = False) -> dict:
     """Fetch a fresh Yahoo snapshot (unless the cache is still fresh).
 
+    While the engine's Fyers push is fresh, the snapshot is rebuilt
+    from it instead — the page then shows live engine data, and the
+    Yahoo snapshot is kept only for VIX / Bank Nifty / Sensex.
     Returns the snapshot in use, with the engine chain overlaid.
     Raises RuntimeError if Yahoo fails and there is nothing cached.
     """
     with _lock:
         state = _load_state()
         snapshot = state["snapshot"]
+        engine = state["engine"]
+        if _engine_is_fresh(engine):
+            base = snapshot
+            if base is None:
+                try:
+                    base = jev_terminal.build_snapshot()
+                except Exception as exc:
+                    raise RuntimeError(
+                        "Engine feed is live but no base snapshot and "
+                        f"Yahoo failed: {exc}") from exc
+                base = jev_terminal.apply_chain_to_snapshot(base, state["chain"])
+                _write_json(SNAPSHOT_FILE, base)
+            return jev_terminal.apply_engine_snapshot(base, engine)
         age = _snapshot_age_seconds(snapshot)
         status = jev_terminal.market_status()
         fresh_enough = age is not None and age < REFRESH_SECONDS
@@ -200,11 +250,16 @@ class Handler(SimpleHTTPRequestHandler):
             except RuntimeError as exc:
                 snap = _load_state()["snapshot"] or {"error": str(exc)}
             state = _load_state()
+            engine = state["engine"]
             return self._send_json({
                 "snapshot": snap,
                 "chainLog": state["chain"],
                 "plan": state["plan"],
                 "events": state["events"],
+                "engine": ({"receivedAt": engine.get("receivedAt"),
+                            "asOf": engine.get("asOf"),
+                            "feed": "fyers" if _engine_is_fresh(engine) else "snapshot"}
+                           if engine else None),
                 "nowIst": datetime.now(jev_terminal.IST).strftime("%H:%M:%S IST"),
             })
         if path in ("/", "/index.html"):
@@ -215,6 +270,45 @@ class Handler(SimpleHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
         body = self._read_body()
+        if path == "/api/engine":
+            # The engine feed is token-protected: without the shared
+            # secret anyone could post fake prices to a public page.
+            if not JEV_TERMINAL_TOKEN:
+                return self._send_json(
+                    {"ok": False,
+                     "error": "engine feed not configured: set JEV_TERMINAL_TOKEN"},
+                    status=503)
+            presented = self.headers.get("X-Jev-Token") or ""
+            if not hmac.compare_digest(presented, JEV_TERMINAL_TOKEN):
+                return self._send_json({"ok": False, "error": "unauthorized"},
+                                       status=401)
+            try:
+                spot = float(body.get("spot"))
+            except (TypeError, ValueError):
+                return self._send_json({"ok": False, "error": "spot is required"},
+                                       status=400)
+            record = {"receivedAt": datetime.now(timezone.utc).isoformat(),
+                      "spot": spot}
+            for key in ("asOf", "tradingDate", "pdh", "pdl", "pdc", "weekPoc",
+                        "callWall", "putWall", "maxPain", "pcr", "gammaFlip",
+                        "regime", "expiryDate"):
+                if body.get(key) is not None:
+                    record[key] = body.get(key)
+            if isinstance(body.get("bars"), list):
+                record["bars"] = body["bars"]
+            _write_json(ENGINE_FILE, record)
+            # Keep the logged chain current too, from the same push.
+            chain_fields = {k: record.get(k) for k in
+                            ("weekPoc", "callWall", "putWall", "pcr", "maxPain")}
+            chain_fields = {k: v for k, v in chain_fields.items()
+                            if v is not None}
+            if chain_fields:
+                today = datetime.now(jev_terminal.IST).date().isoformat()
+                previous = _read_json(CHAIN_FILE) or {}
+                merged = {**previous, **chain_fields, "logDate": today,
+                          "createdAt": record["receivedAt"]}
+                _write_json(CHAIN_FILE, merged)
+            return self._send_json({"ok": True, "engine": record})
         if path == "/api/chain":
             chain = {k: body.get(k) for k in
                      ("weekPoc", "callWall", "putWall", "pcr", "maxPain")}

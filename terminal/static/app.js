@@ -45,7 +45,7 @@
       const s = data.snapshot || {};
       const chain = data.chainLog || {};
       const plan = (data.plan && data.plan.payload) || null;
-      $("status").textContent = (s.marketStatus || "—") + " · " + (s.istTime || data.nowIst || "") + " · " + (s.source || "");
+      $("status").textContent = (s.marketStatus || "—") + " · " + (s.istTime || data.nowIst || "") + " · " + (s.feed === "fyers" ? "Fyers engine feed" : "snapshot");
       $("spot").textContent = fmt(s.spot);
       $("spot").className = "big " + ((s.change || 0) >= 0 ? "up" : "down");
       $("change").textContent = (s.change >= 0 ? "+" : "") + fmt(s.change) + " (" + pct(s.changePct) + ") vs PDC " + fmt(s.pdc);
