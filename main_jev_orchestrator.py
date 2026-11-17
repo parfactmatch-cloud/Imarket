@@ -87,8 +87,9 @@ def _fmt_level(value) -> str:
 
 def _signal_alert_details(*, spot, imb_tag, ctx_tag, bar_delta, strike,
                           option_type, premium, expiry, sl, t1, t2, qty,
-                          call_wall=None, put_wall=None, week_poc=None):
-    """Details text for the NIFTY BUY/SELL SIGNAL Telegram alert.
+                          call_wall=None, put_wall=None, week_poc=None,
+                          lot_size=75):
+    """Rows for the NIFTY BUY/SELL SIGNAL Telegram card.
 
     Includes the stop-loss and targets, not just the premium, so the
     risk on the trade is visible in the message itself, plus the call
@@ -96,14 +97,21 @@ def _signal_alert_details(*, spot, imb_tag, ctx_tag, bar_delta, strike,
     -- so the levels can be cross-checked against the live chain.
     Missing values print as "n/a" rather than being guessed.
     """
-    return (
-        f"Spot: {spot} | {imb_tag}\nContext: {ctx_tag} | "
-        f"Bar Delta: {bar_delta}\nStrike: NIFTY {strike} {option_type} "
-        f"| Premium: {premium} | Expiry: {expiry.isoformat()}\n"
-        f"SL: {sl} | T1: {t1} | T2: {t2} | Qty: {qty}\n"
-        f"Walls: C {_fmt_level(call_wall)} / P {_fmt_level(put_wall)} "
-        f"| Week POC: {_fmt_level(week_poc)}"
-    )
+    lots = qty // lot_size if lot_size else 0
+    qty_text = f"{qty} ({lots} lot{'s' if lots != 1 else ''})" if lots else str(qty)
+    return [
+        ("NIFTY Spot", f"{spot:,.2f}"),
+        ("Setup", imb_tag),
+        ("Context", ctx_tag),
+        ("Bar Delta", f"{bar_delta:,}"),
+        ("Strike", f"NIFTY {strike} {option_type}"),
+        ("Premium", f"₹{premium:.2f}"),
+        ("Expiry", expiry.strftime("%a %d %b %Y")),
+        ("SL / T1 / T2", f"₹{sl:.2f} / ₹{t1:.2f} / ₹{t2:.2f}"),
+        ("Qty", qty_text),
+        ("Walls", f"C {_fmt_level(call_wall)} / P {_fmt_level(put_wall)}"),
+        ("Week POC", _fmt_level(week_poc)),
+    ]
 
 
 def _profile_from_candles(candles):
@@ -376,17 +384,25 @@ def start_system():
                 daily_profile=ProfileLevels(pdh, pdl, pdc, []),
             )
 
-        tg.send_alert(
+        # Expiry is computed before the startup card so the card can show it.
+        expiry = next_weekly_expiry(now=get_ist_now(), override=config.expiry_override)
+        logger.info("Weekly expiry in use: %s", expiry.isoformat())
+
+        tg.send_card(
             "System Online (Live Feed)",
-            f"Jev Engine ({mode_label})\nNifty PDH: {pdh} | PDL: {pdl}\n"
-            f"Week POC: {levels['week_poc']} | Status: Live Scanning",
+            [
+                ("Prev close", f"{pdc:,.2f}"),
+                ("PDH / PDL", f"{pdh:,.2f} / {pdl:,.2f}"),
+                ("Week POC", _fmt_level(levels["week_poc"])),
+                ("Mode", mode_label),
+                ("Expiry", expiry.strftime("%a %d %b %Y")),
+            ],
         )
 
         lag_engine = LagNeutralizedEngine(pdh=pdh, pdl=pdl, pdc=pdc)
         fp_engine = AdvancedAuctionFootprintEngine(tick_size=0.05, imbalance_ratio=3.0, stacked_count=3)
         monitor = PositionMonitor(state_store, router, quote_fn=quote_fn, config=config)
-        expiry = next_weekly_expiry(now=get_ist_now(), override=config.expiry_override)
-        logger.info("Weekly expiry in use: %s", expiry.isoformat())
+
 
         bar_ticks = []
         bars_5m_history = fetch_5m_history(fyers)
@@ -472,7 +488,7 @@ def start_system():
             # Same cached snapshot the signal decision used, so the walls
             # printed are the walls the trade was judged against.
             snapshot = get_gex_snapshot(fast_bar.close)
-            tg.send_alert(
+            tg.send_card(
                 f"NIFTY {'BUY' if option_type == 'CE' else 'SELL'} SIGNAL",
                 _signal_alert_details(
                     spot=fast_bar.close, imb_tag=imb_tag, ctx_tag=ctx_tag,
@@ -484,6 +500,7 @@ def start_system():
                     put_wall=snapshot.put_wall if snapshot else None,
                     week_poc=mtf_context.get("poc"),
                 ),
+                footer_extra=mode_label,
             )
             result = router.execute_buy(
                 symbol=symbol, qty=config.lot_size, ltp=premium, sl=sl, t1=t1, t2=t2,
@@ -593,10 +610,15 @@ def start_system():
             # 30-Minute Live Heartbeat Telemetry
             if (now_ts - last_heartbeat_time) >= 1800:
                 last_heartbeat_time = now_ts
-                tg.send_alert(
+                change = latest_ltp - pdc
+                tg.send_card(
                     "Engine Heartbeat",
-                    f"Nifty Spot: {latest_ltp}\nRunning CVD: {fp_engine.running_cvd}\n"
-                    f"Status: Active & Scanning",
+                    [
+                        ("NIFTY Spot", f"{latest_ltp:,.2f} ({change:+,.2f} vs prev close)"),
+                        ("Running CVD", f"{fp_engine.running_cvd:,}"),
+                        ("Status", "Active & Scanning"),
+                    ],
+                    footer_extra=mode_label,
                 )
 
             if elapsed >= BAR_SECONDS:
@@ -637,17 +659,22 @@ def start_system():
                 if not squared_off and (now_ist.hour, now_ist.minute) >= (sq_hour, sq_min):
                     squared_off = True
                     actions = monitor.square_off_all()
-                    tg.send_alert(
-                        "End-of-Day Square-Off",
-                        "All open positions closed at market.\n" + "\n".join(actions)
-                        if actions else "No open positions to square off.",
-                    )
+                    if actions:
+                        rows = [("Status", "All open positions closed at market")]
+                        rows += [("Closed", a) for a in actions]
+                    else:
+                        rows = [("Positions", "No open positions to square off")]
+                    tg.send_card("End-of-Day Square-Off", rows, footer_extra=mode_label)
                     logger.info("End-of-day square-off done: %s", actions)
                 if (now_ist.hour, now_ist.minute) >= (cl_hour, cl_min):
-                    tg.send_alert(
+                    tg.send_card(
                         "Session Closed",
-                        f"Market closed at 3:30 PM IST.\nFinal Nifty Spot: {latest_ltp} | "
-                        f"Session CVD: {fp_engine.running_cvd}",
+                        [
+                            ("Final NIFTY Spot", f"{latest_ltp:,.2f}"),
+                            ("Session CVD", f"{fp_engine.running_cvd:,}"),
+                            ("Market close", "3:30 PM IST"),
+                        ],
+                        footer_extra=mode_label,
                     )
                     # Close the socket BEFORE signalling shutdown: no more
                     # ticks may arrive once the main thread closes the
