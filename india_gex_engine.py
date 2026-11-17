@@ -7,7 +7,7 @@ Designed for NIFTY 50, FINNIFTY, and SENSEX.
 import logging
 import math
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 import numpy as np
 
 logger = logging.getLogger(__name__)
