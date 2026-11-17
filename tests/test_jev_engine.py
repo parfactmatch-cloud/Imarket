@@ -15,7 +15,7 @@ import pytest
 from config import JevConfig
 from engine_state_store import EngineStateStore, PositionState
 from execution_broker_interface import ExecutionRouter
-from expiry import next_weekly_expiry, option_symbol
+from expiry import is_monthly_expiry, next_weekly_expiry, option_symbol
 from fyers_auth_automation import FyersAuthManager
 from gamma_blast_detector import GammaBlastDetector, StrikeTelemetry
 from greeks_structural_engine import BarData, GreeksState, GreeksStructuralEngine
@@ -135,9 +135,23 @@ def test_next_weekly_expiry_override():
 
 
 def test_option_symbol_format():
-    assert option_symbol("NIFTY", date(2026, 11, 26), 23250, "CE") == "NSE:NIFTY26NOV23250CE"
-    assert option_symbol("NIFTY", date(2026, 11, 17), 25300, "CE") == "NSE:NIFTY17NOV25300CE"
-    assert option_symbol("NIFTY", date(2026, 12, 3), 24000, "PE") == "NSE:NIFTY03DEC24000PE"
+    # Weekly (ordinary Tuesday): YYMdd, month code N for November.
+    assert option_symbol("NIFTY", date(2026, 11, 17), 25300, "CE") == "NSE:NIFTY26N1725300CE"
+    assert option_symbol("NIFTY", date(2026, 11, 17), 25300, "PE") == "NSE:NIFTY26N1725300PE"
+    # Monthly (last Tuesday of the month): YYMMM.
+    assert option_symbol("NIFTY", date(2026, 11, 24), 23250, "CE") == "NSE:NIFTY26NOV23250CE"
+    # Other weekly month codes: October -> O, December -> D, January -> 1.
+    assert option_symbol("NIFTY", date(2026, 10, 6), 24000, "PE") == "NSE:NIFTY26O0624000PE"
+    assert option_symbol("NIFTY", date(2026, 12, 1), 24000, "CE") == "NSE:NIFTY26D0124000CE"
+    assert option_symbol("NIFTY", date(2027, 1, 5), 24000, "CE") == "NSE:NIFTY2710524000CE"
+
+
+def test_monthly_expiry_detection():
+    assert is_monthly_expiry(date(2026, 11, 24))  # last Tuesday of Nov 2026
+    assert not is_monthly_expiry(date(2026, 11, 17))
+    assert is_monthly_expiry(date(2026, 12, 29))  # last Tuesday of Dec 2026
+    assert not is_monthly_expiry(date(2026, 12, 1))
+    assert not is_monthly_expiry(date(2026, 11, 18))  # not a Tuesday
 
 
 # ---------------------------------------------------------------- option pricing

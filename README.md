@@ -166,9 +166,11 @@ These fixes address every finding:
   treat them as a real volume profile.
 - **Expiry holidays are not known from the calendar.** If the
   Tuesday expiry is a trading holiday, set `FYERS_EXPIRY_OVERRIDE`.
-- **Option symbol format** (`NSE:NIFTY26NOV23250CE`, DDMMM) follows
-  the repo's existing convention. Verify it against the Fyers symbol
-  master before any live use.
+- **Option symbol format** follows Fyers' symbology docs (updated
+  14 Oct 2026): weekly `NSE:NIFTY26N1725300CE` (YYMdd, month code
+  1-9/O/N/D) and monthly `NSE:NIFTY26NOV23250CE` (YYMMM) on the last
+  Tuesday of the month. The old DDMMM format matched no Fyers format
+  and would have been rejected as an invalid symbol.
 - **GEX option-chain parsing is defensive** and depends on the
   Fyers client's option-chain method/response shape; if it cannot be
   parsed, GEX is unavailable and the engine holds.

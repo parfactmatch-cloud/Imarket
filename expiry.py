@@ -12,11 +12,19 @@ symbols built from a Thursday date cannot trade.)
 The old code before that hardcoded the expiry into every symbol
 (``NSE:NIFTY26NOV...``), which silently broke after that date passed.
 
-Symbol format (preserved from the original code): the expiry is encoded
-as DDMMM, e.g. Tuesday 17 Nov 2026 -> ``17NOV``, giving
-``NSE:NIFTY17NOV23250CE``. Verify this format against the Fyers symbol
-master before any live use -- it is the repo's existing convention,
-not a newly invented one. Only the weekday changed here, not the format.
+Symbol format (verified against Fyers' symbology docs, updated
+14 Oct 2026 -- the repo's old DDMMM code, e.g. ``NSE:NIFTY17NOV23250CE``,
+matched no Fyers format and would have been rejected as an invalid
+symbol on the first quote or order, which is why no signal has ever
+traded):
+
+- Weekly expiry: ``NSE:NIFTY{YY}{M}{dd}{Strike}{CE|PE}``, where ``M``
+  is a one-character month code -- "1".."9" for Jan-Sep, "O" for Oct,
+  "N" for Nov, "D" for Dec. E.g. Tue 17 Nov 2026, 25300 CE ->
+  ``NSE:NIFTY26N1725300CE``.
+- Monthly expiry (the last Tuesday of the month, when the expiring
+  contract is the monthly one): ``NSE:NIFTY{YY}{MMM}{Strike}{CE|PE}``,
+  e.g. Tue 24 Nov 2026, 23250 CE -> ``NSE:NIFTY26NOV23250CE``.
 
 Limitation: trading holidays are not known from calendar logic alone.
 If the Tuesday expiry is a holiday, expiry moves to the previous
@@ -62,13 +70,40 @@ def next_weekly_expiry(now=None, override: str = "") -> date:
     return expiry
 
 
+# Fyers weekly month codes: Jan-Sep are "1".."9", Oct/Nov/Dec are "O"/"N"/"D".
+_WEEKLY_MONTH_CODES = "123456789OND"
+
+
+def is_monthly_expiry(expiry: date) -> bool:
+    """True when ``expiry`` is the last Tuesday of its month.
+
+    NSE NIFTY monthly options expire on the last Tuesday of the month;
+    on that day the expiring contract is the monthly one, not a weekly.
+    """
+    if expiry.weekday() != 1:  # Tuesday == 1 (Monday == 0).
+        return False
+    # The last Tuesday is the Tuesday in the final 7 days of the month.
+    return (expiry + timedelta(days=7)).month != expiry.month
+
+
 def expiry_symbol_suffix(expiry: date) -> str:
-    """DDMMM suffix used in Fyers option symbols, e.g. 17NOV."""
-    return f"{expiry.day:02d}{expiry.strftime('%b').upper()}"
+    """Expiry code for a Fyers option symbol.
+
+    Weekly: YYMdd -- two-digit year, one-character month code, two-digit
+    day. E.g. Tue 17 Nov 2026 -> ``26N17``.
+    Monthly (last Tuesday of the month): YYMMM, e.g. Tue 24 Nov 2026 ->
+    ``26NOV``.
+    """
+    yy = expiry.strftime("%y")
+    if is_monthly_expiry(expiry):
+        return f"{yy}{expiry.strftime('%b').upper()}"
+    month_code = _WEEKLY_MONTH_CODES[expiry.month - 1]
+    return f"{yy}{month_code}{expiry.day:02d}"
 
 
 def option_symbol(underlying: str, expiry: date, strike: int, option_type: str) -> str:
-    """Build a Fyers option symbol, e.g. NSE:NIFTY17NOV23250CE."""
+    """Build a Fyers option symbol, e.g. NSE:NIFTY26N1725300CE (weekly)
+    or NSE:NIFTY26NOV23250CE (monthly, last Tuesday of the month)."""
     if option_type not in ("CE", "PE"):
         raise ValueError("option_type must be 'CE' or 'PE'")
     return f"NSE:{underlying}{expiry_symbol_suffix(expiry)}{int(strike)}{option_type}"
