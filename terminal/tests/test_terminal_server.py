@@ -158,5 +158,101 @@ class TestEngineEndpoint(unittest.TestCase):
         self.assertEqual(data["engine"]["feed"], "snapshot")
 
 
+class TestWriteEndpointAuth(unittest.TestCase):
+    """Every write endpoint except /api/engine used to take no token."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.data_dir = Path(os.environ["JEV_TERMINAL_DATA_DIR"])
+        (cls.data_dir / "snapshot.json").write_text(
+            json.dumps(_base_snapshot()), encoding="utf-8")
+        cls.httpd = ThreadingHTTPServer(
+            ("127.0.0.1", 0), terminal_server.Handler)
+        cls.port = cls.httpd.server_address[1]
+        cls.thread = threading.Thread(target=cls.httpd.serve_forever,
+                                      daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+
+    def _request(self, path, method="GET", body=None, token=None):
+        headers = {"Content-Type": "application/json"}
+        if token is not None:
+            headers["X-Jev-Token"] = token
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{self.port}{path}",
+            data=json.dumps(body).encode("utf-8") if body is not None else None,
+            headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                return resp.status, json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            return exc.code, json.loads(exc.read().decode("utf-8"))
+
+    def test_chain_post_without_token_is_rejected(self):
+        status, _ = self._request("/api/chain", method="POST",
+                                  body={"callWall": 26000, "putWall": 25000})
+        self.assertEqual(status, 401)
+
+    def test_chain_post_with_wrong_token_is_rejected(self):
+        status, _ = self._request("/api/chain", method="POST",
+                                  body={"callWall": 26000, "putWall": 25000},
+                                  token="not-the-token")
+        self.assertEqual(status, 401)
+
+    def test_chain_post_with_token_succeeds(self):
+        status, body = self._request(
+            "/api/chain", method="POST",
+            body={"callWall": 26000, "putWall": 25000, "maxPain": 25200,
+                  "pcr": 0.90},
+            token="test-token-123")
+        self.assertEqual(status, 200)
+        self.assertTrue(body["ok"])
+        _, data = self._request("/api/terminal")
+        self.assertEqual(data["chainLog"]["callWall"], 26000)
+        self.assertEqual(data["chainLog"]["maxPain"], 25200)
+
+    def test_events_post_without_token_is_rejected(self):
+        status, _ = self._request("/api/events", method="POST",
+                                  body={"kind": "note", "text": "hello"})
+        self.assertEqual(status, 401)
+
+    def test_events_delete_without_token_is_rejected(self):
+        _, created = self._request("/api/events", method="POST",
+                                   body={"kind": "note", "text": "to delete"},
+                                   token="test-token-123")
+        event_id = created["event"]["id"]
+        status, _ = self._request(f"/api/events?id={event_id}",
+                                  method="DELETE")
+        self.assertEqual(status, 401)
+        _, data = self._request("/api/terminal")
+        self.assertIn(event_id, [e["id"] for e in data["events"]])
+
+    def test_events_delete_with_token_succeeds(self):
+        _, created = self._request("/api/events", method="POST",
+                                   body={"kind": "note", "text": "to delete"},
+                                   token="test-token-123")
+        event_id = created["event"]["id"]
+        status, body = self._request(f"/api/events?id={event_id}",
+                                     method="DELETE", token="test-token-123")
+        self.assertEqual(status, 200)
+        self.assertTrue(body["ok"])
+        _, data = self._request("/api/terminal")
+        self.assertNotIn(event_id, [e["id"] for e in data["events"]])
+
+    def test_plan_build_without_token_is_rejected(self):
+        status, _ = self._request("/api/plan/build", method="POST", body={})
+        self.assertEqual(status, 401)
+
+    def test_plan_note_without_token_is_rejected(self):
+        status, _ = self._request("/api/plan/note", method="POST",
+                                  body={"planDate": "2026-11-17",
+                                        "note": "hello"})
+        self.assertEqual(status, 401)
+
+
 if __name__ == "__main__":
     unittest.main()

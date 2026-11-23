@@ -41,6 +41,11 @@ Endpoints:
     POST /api/plan/note     save a note on a plan {planDate, note}
     POST /api/plan/build    rebuild the post-market plan from the latest snapshot
 
+    Every write endpoint above requires the X-Jev-Token header matching
+    the JEV_TERMINAL_TOKEN env var (same as POST /api/engine): without
+    that env var it answers 503, with a wrong token 401. Read endpoints
+    need no token.
+
 State lives in JSON files under the data directory
 (``JEV_TERMINAL_DATA_DIR`` or ``terminal/data`` next to this file).
 ``data/seed.json`` — the last verified session (Mon 16 Nov 2026) —
@@ -233,6 +238,26 @@ class Handler(SimpleHTTPRequestHandler):
         except (json.JSONDecodeError, UnicodeDecodeError):
             return {}
 
+    def _require_token(self) -> bool:
+        """Shared-secret check for write endpoints (same as /api/engine).
+
+        Returns True when the request carries the X-Jev-Token header
+        matching JEV_TERMINAL_TOKEN; otherwise sends the 503 (token not
+        configured) or 401 (wrong token) response and returns False.
+        """
+        if not JEV_TERMINAL_TOKEN:
+            self._send_json(
+                {"ok": False,
+                 "error": "write endpoints not configured: set JEV_TERMINAL_TOKEN"},
+                status=503)
+            return False
+        presented = self.headers.get("X-Jev-Token") or ""
+        if not hmac.compare_digest(presented, JEV_TERMINAL_TOKEN):
+            self._send_json({"ok": False, "error": "unauthorized"},
+                            status=401)
+            return False
+        return True
+
     def do_GET(self):
         parsed = urlparse(self.path)
         path, query = parsed.path, parse_qs(parsed.query)
@@ -323,6 +348,8 @@ class Handler(SimpleHTTPRequestHandler):
                 _write_json(CHAIN_FILE, merged)
             return self._send_json({"ok": True, "engine": record})
         if path == "/api/chain":
+            if not self._require_token():
+                return
             chain = {k: body.get(k) for k in
                      ("weekPoc", "callWall", "putWall", "pcr", "maxPain")}
             chain = {k: v for k, v in chain.items() if v is not None}
@@ -339,6 +366,8 @@ class Handler(SimpleHTTPRequestHandler):
                             jev_terminal.apply_chain_to_snapshot(snap, record))
             return self._send_json({"ok": True, "chain": record})
         if path == "/api/events":
+            if not self._require_token():
+                return
             kind = str(body.get("kind") or "note")
             text = str(body.get("text") or "").strip()
             if not text:
@@ -352,11 +381,15 @@ class Handler(SimpleHTTPRequestHandler):
             _write_json(EVENTS_FILE, events)
             return self._send_json({"ok": True, "event": entry})
         if path == "/api/plan/build":
+            if not self._require_token():
+                return
             try:
                 return self._send_json(build_plan())
             except RuntimeError as exc:
                 return self._send_json({"ok": False, "error": str(exc)}, status=502)
         if path == "/api/plan/note":
+            if not self._require_token():
+                return
             plan_date = str(body.get("planDate") or "")
             note = str(body.get("note") or "")
             state = _load_state()
@@ -371,6 +404,8 @@ class Handler(SimpleHTTPRequestHandler):
     def do_DELETE(self):
         parsed = urlparse(self.path)
         if parsed.path == "/api/events":
+            if not self._require_token():
+                return
             try:
                 event_id = int(parse_qs(parsed.query).get("id", [""])[0])
             except ValueError:
