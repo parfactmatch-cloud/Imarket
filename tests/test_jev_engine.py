@@ -120,13 +120,37 @@ def test_next_weekly_expiry_tuesday_before_close():
 
 
 def test_next_weekly_expiry_tuesday_after_close_rolls_forward():
-    assert next_weekly_expiry(datetime(2026, 11, 17, 16, 0, tzinfo=IST)) == date(2026, 11, 24)
+    # Tue 17 Nov after close rolls to the next Tuesday, 24 Nov -- but
+    # 24 Nov 2026 is Guru Nanak Jayanti, so expiry shifts back to
+    # Mon 23 Nov 2026 (the actual November monthly expiry).
+    assert next_weekly_expiry(datetime(2026, 11, 17, 16, 0, tzinfo=IST)) == date(2026, 11, 23)
 
 
 def test_next_weekly_expiry_thursday_is_not_expiry():
     # NIFTY weeklies moved Thursday -> Tuesday on 1 Sep 2025: a Thursday
     # now rolls forward to the next Tuesday, it is never expiry itself.
-    assert next_weekly_expiry(datetime(2026, 11, 19, 10, 0, tzinfo=IST)) == date(2026, 11, 24)
+    # Thu 19 Nov rolls to Tue 24 Nov, a holiday, so Mon 23 Nov.
+    assert next_weekly_expiry(datetime(2026, 11, 19, 10, 0, tzinfo=IST)) == date(2026, 11, 23)
+
+
+def test_next_weekly_expiry_holiday_tuesday_shifts_to_monday():
+    # Run #56 (Mon 23 Nov 2026) aimed at Tue 24 Nov, a series that does
+    # not exist, and held all day on an empty chain. The Monday before
+    # a holiday Tuesday IS the expiry.
+    assert next_weekly_expiry(datetime(2026, 11, 23, 10, 0, tzinfo=IST)) == date(2026, 11, 23)
+    assert next_weekly_expiry(datetime(2026, 11, 18, 10, 0, tzinfo=IST)) == date(2026, 11, 23)
+    # Tue 10 Nov 2026 is Diwali-Balipratipada: Mon 9 Nov is the expiry.
+    assert next_weekly_expiry(datetime(2026, 11, 9, 10, 0, tzinfo=IST)) == date(2026, 11, 9)
+    # Tue 20 Oct 2026 is Dussehra: Mon 19 Oct is the expiry.
+    assert next_weekly_expiry(datetime(2026, 10, 19, 10, 0, tzinfo=IST)) == date(2026, 10, 19)
+    # Tue 3 Mar 2026 is Holi: Mon 2 Mar is the expiry.
+    assert next_weekly_expiry(datetime(2026, 3, 2, 10, 0, tzinfo=IST)) == date(2026, 3, 2)
+
+
+def test_next_weekly_expiry_normal_tuesday_after_holiday_week():
+    # After the holiday week, the next expiry is an ordinary Tuesday.
+    assert next_weekly_expiry(datetime(2026, 11, 30, 10, 0, tzinfo=IST)) == date(2026, 12, 1)
+    assert next_weekly_expiry(datetime(2026, 11, 25, 10, 0, tzinfo=IST)) == date(2026, 12, 1)
 
 
 def test_next_weekly_expiry_override():
@@ -140,6 +164,11 @@ def test_option_symbol_format():
     assert option_symbol("NIFTY", date(2026, 11, 17), 25300, "PE") == "NSE:NIFTY26N1725300PE"
     # Monthly (last Tuesday of the month): YYMMM.
     assert option_symbol("NIFTY", date(2026, 11, 24), 23250, "CE") == "NSE:NIFTY26NOV23250CE"
+    # Monthly expiry shifted to Monday by a holiday Tuesday keeps the
+    # monthly symbol: Mon 23 Nov 2026 is the same 26NOV contract.
+    assert option_symbol("NIFTY", date(2026, 11, 23), 25300, "CE") == "NSE:NIFTY26NOV25300CE"
+    # Weekly expiry shifted to Monday keeps the weekly day-code symbol.
+    assert option_symbol("NIFTY", date(2026, 11, 9), 25300, "CE") == "NSE:NIFTY26N0925300CE"
     # Other weekly month codes: October -> O, December -> D, January -> 1.
     assert option_symbol("NIFTY", date(2026, 10, 6), 24000, "PE") == "NSE:NIFTY26O0624000PE"
     assert option_symbol("NIFTY", date(2026, 12, 1), 24000, "CE") == "NSE:NIFTY26D0124000CE"
@@ -152,6 +181,13 @@ def test_monthly_expiry_detection():
     assert is_monthly_expiry(date(2026, 12, 29))  # last Tuesday of Dec 2026
     assert not is_monthly_expiry(date(2026, 12, 1))
     assert not is_monthly_expiry(date(2026, 11, 18))  # not a Tuesday
+    # Holiday-shifted monthly expiry: Mon 23 Nov 2026 is still monthly.
+    assert is_monthly_expiry(date(2026, 11, 23))
+    # Holiday-shifted weekly expiry: Mon 9 Nov 2026 is not monthly.
+    assert not is_monthly_expiry(date(2026, 11, 9))
+    # Tue 31 Mar 2026 is a holiday and the last Tuesday of March:
+    # its shifted Monday, 30 Mar, is still the monthly expiry.
+    assert is_monthly_expiry(date(2026, 3, 30))
 
 
 # ---------------------------------------------------------------- option pricing
