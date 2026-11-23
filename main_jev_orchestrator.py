@@ -30,6 +30,7 @@ import logging
 import os
 import threading
 import time
+from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 
 from fyers_apiv3 import fyersModel
@@ -446,6 +447,11 @@ def start_system():
                     week_poc=levels.get("week_poc"),
                     gex_snapshot=gex, expiry=expiry,
                     bars=bars_5m_history, trading_date=get_ist_now().date(),
+                    # The close job reads open positions from this
+                    # snapshot: the engine's SQLite store does not
+                    # survive to the next Actions job.
+                    positions=[asdict(p) for p in
+                               state_store.load_open_positions().values()],
                 )
                 ok, err = push_engine_snapshot(
                     config.terminal_url, config.terminal_token, payload)

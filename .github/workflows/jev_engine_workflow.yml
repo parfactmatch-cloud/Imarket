@@ -40,3 +40,39 @@ jobs:
           JEV_TERMINAL_TOKEN: ${{ secrets.JEV_TERMINAL_TOKEN }}
         run: |
           python main_jev_orchestrator.py
+
+  close-engine:
+    needs: run-engine
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run Jev Close Job
+        env:
+          FYERS_APP_ID: ${{ secrets.FYERS_APP_ID }}
+          FYERS_SECRET_KEY: ${{ secrets.FYERS_SECRET_KEY }}
+          FYERS_ID: ${{ secrets.FYERS_ID }}
+          FYERS_PIN: ${{ secrets.FYERS_PIN }}
+          FYERS_TOTP_KEY: ${{ secrets.FYERS_TOTP_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          PAPER_MODE: "True"
+          JEV_TERMINAL_URL: ${{ secrets.JEV_TERMINAL_URL }}
+          JEV_TERMINAL_TOKEN: ${{ secrets.JEV_TERMINAL_TOKEN }}
+        run: |
+          python close_jev_session.py

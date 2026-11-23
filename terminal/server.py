@@ -23,13 +23,18 @@ Endpoints:
     POST /api/engine        live feed from the running engine (token):
                             {spot, asOf, tradingDate, pdh, pdl, pdc,
                              weekPoc, callWall, putWall, maxPain, pcr,
-                             gammaFlip, regime, expiryDate, bars}
+                             gammaFlip, regime, expiryDate, positions, bars}
                             While a push is fresh (under 10 minutes old)
                             the page shows it as the Fyers engine feed;
                             otherwise it falls back to Yahoo snapshots.
                             Requires the X-Jev-Token header matching the
                             JEV_TERMINAL_TOKEN env var; without that env
                             var the endpoint is disabled.
+                            ``positions`` is the engine's open positions
+                            (serialised PositionState dicts); the close
+                            job reads them from GET /api/terminal, since
+                            the engine's SQLite store does not survive
+                            to the next Actions job.
     POST /api/events        add an engine session-log entry
                             {kind, text}  kind: online|signal|position|squareoff|closed|note
     DELETE /api/events?id=  delete one entry
@@ -256,8 +261,11 @@ class Handler(SimpleHTTPRequestHandler):
                 "chainLog": state["chain"],
                 "plan": state["plan"],
                 "events": state["events"],
-                "engine": ({"receivedAt": engine.get("receivedAt"),
-                            "asOf": engine.get("asOf"),
+                # The full engine record, not just a summary: the close
+                # job reads its open positions (and levels) from here.
+                # The page only uses receivedAt/asOf/feed and ignores
+                # the extra keys.
+                "engine": ({**engine,
                             "feed": "fyers" if _engine_is_fresh(engine) else "snapshot"}
                            if engine else None),
                 "nowIst": datetime.now(jev_terminal.IST).strftime("%H:%M:%S IST"),
@@ -296,6 +304,11 @@ class Handler(SimpleHTTPRequestHandler):
                     record[key] = body.get(key)
             if isinstance(body.get("bars"), list):
                 record["bars"] = body["bars"]
+            if isinstance(body.get("positions"), list):
+                # Open positions, read by the close job (GET /api/terminal).
+                # An empty list is stored as-is: it is how the close job
+                # tells "already closed" from "field missing".
+                record["positions"] = body["positions"]
             _write_json(ENGINE_FILE, record)
             # Keep the logged chain current too, from the same push.
             chain_fields = {k: record.get(k) for k in
