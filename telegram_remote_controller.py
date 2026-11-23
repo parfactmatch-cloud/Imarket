@@ -25,6 +25,7 @@ ALERT_ICONS = {
     "Quote Unavailable": "⚠️",
     "End-of-Day Square-Off": "🛑",
     "Session Closed": "🏁",
+    "Post-Market Playbook": "📋",
     "System Shutdown": "🛑",
 }
 

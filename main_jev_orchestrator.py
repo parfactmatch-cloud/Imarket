@@ -649,6 +649,52 @@ def start_system():
             hour, minute = value.split(":")
             return int(hour), int(minute)
 
+        def _send_playbook_card():
+            """Post-market playbook: today's levels and tomorrow's plan, on Telegram.
+
+            Run #56 (23 Nov 2026) ended with no levels and no playbook
+            anywhere: GEX was zero so the terminal showed walls / max pain /
+            PCR as n/a, and the only close message was Session Closed with
+            spot and CVD. This card is the record of the day that survives
+            even if the terminal restarts. It never raises: a failed card
+            must not block shutdown.
+            """
+            try:
+                if bars_5m_history:
+                    today_high = max(b.high for b in bars_5m_history)
+                    today_low = min(b.low for b in bars_5m_history)
+                else:
+                    today_high, today_low = pdh, pdl
+                gex = None
+                try:
+                    gex = get_gex_snapshot(latest_ltp)
+                except Exception as exc:
+                    logger.warning("Playbook GEX read failed: %s", exc)
+                change = latest_ltp - pdc
+                bias = "Bullish" if latest_ltp >= pdc else "Bearish"
+                if gex is not None:
+                    walls = f"{gex.call_wall:,.0f} / {gex.put_wall:,.0f}"
+                    pain = f"{gex.max_pain:,.0f} / {gex.pcr:.2f}"
+                    flip = f"{gex.gamma_flip_level:,.2f} / {gex.market_regime}"
+                else:
+                    walls = pain = flip = "n/a — GEX unavailable"
+                tg.send_card(
+                    "Post-Market Playbook",
+                    [
+                        ("NIFTY Close", f"{latest_ltp:,.2f} ({change:+,.2f} vs prev close)"),
+                        ("Day range", f"{today_low:,.2f} - {today_high:,.2f}"),
+                        ("Call wall / Put wall", walls),
+                        ("Max pain / PCR", pain),
+                        ("Gamma flip / Regime", flip),
+                        ("Tomorrow PDH / PDL", f"{today_high:,.2f} / {today_low:,.2f}"),
+                        ("Tomorrow PDC / Bias", f"{latest_ltp:,.2f} / {bias}"),
+                        ("Next expiry", expiry.strftime("%a %d %b %Y")),
+                    ],
+                    footer_extra=mode_label,
+                )
+            except Exception as exc:
+                logger.warning("Post-market playbook failed: %s", exc)
+
         # Market Close Watcher: square off, then shut down gracefully.
         def market_close_watcher():
             sq_hour, sq_min = _parse_hhmm(config.square_off_time)
@@ -676,6 +722,12 @@ def start_system():
                         ],
                         footer_extra=mode_label,
                     )
+                    # Playbook + one final terminal push, so the day's
+                    # levels reach the user and the terminal even when
+                    # the session had no signals: run #56 ended with
+                    # neither. Neither step may block shutdown.
+                    _send_playbook_card()
+                    _push_to_terminal(latest_ltp)
                     # Close the socket BEFORE signalling shutdown: no more
                     # ticks may arrive once the main thread closes the
                     # state store. (The old code set the event first and

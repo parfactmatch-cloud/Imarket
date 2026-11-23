@@ -5,12 +5,22 @@ was 0 and net dealer GEX read 0.00 all day (run #51). These tests pin the
 fix: IV is derived from each option's LTP when the chain omits it, with a
 documented fallback, and a zero net GEX on a real chain is treated as
 unavailable instead of a regime.
+
+On 23 Nov 2026 a second zero-GEX day (run #56) showed the parser itself
+was blind: Fyers returns FLAT rows, one per option leg, but the parser
+only read nested ``call``/``put`` dicts per strike, so it saw OI 0, IV 0
+and LTP 0 on all 63 rows. The flat-chain tests below pin that fix: the
+index row is skipped, CE/PE legs group by strike, IV comes from the
+nested ``greeks`` object (requested with ``greeks=1``), and the chain is
+pinned to the engine's expiry via ``timestamp`` with a fallback.
 """
 import math
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 
 from india_gex_engine import IndiaGEXEngine, OptionStrikeData
-from market_data import compute_gex_snapshot
+from market_data import _parse_chain_rows, compute_gex_snapshot
+
+IST = timezone(timedelta(hours=5, minutes=30))
 
 
 def _bs_price(spot, strike, tte, iv, is_call, r=0.07):
@@ -123,3 +133,96 @@ def test_missing_iv_chain_via_snapshot_is_real():
     assert snap is not None
     assert snap.net_gex != 0.0
     assert snap.gamma_flip_level != 25455.90
+
+
+# ---------------------------------------------------------------- flat Fyers rows (run #56)
+def _flat_rows(spot, tte, iv=0.13, greeks=True):
+    """Fyers-style flat rows, as run #56 actually returned them: the index
+    row first (strike -1, empty option_type), then one CE and one PE leg
+    per strike, each with oi / ltp and, when greeks=True, a nested
+    ``greeks`` object carrying iv."""
+    rows = [{"strike_price": -1, "option_type": "", "symbol": "NSE:NIFTY50-INDEX",
+             "fp": spot, "ltp": spot, "ask": spot, "bid": spot}]
+    for strike, c_oi, p_oi in [(25300, 80000, 150000), (25350, 120000, 300000),
+                               (25400, 200000, 500000), (25450, 350000, 400000),
+                               (25500, 500000, 250000), (25550, 300000, 120000),
+                               (25600, 150000, 80000)]:
+        for opt, oi in (("CE", c_oi), ("PE", p_oi)):
+            is_call = opt == "CE"
+            row = {"strike_price": strike, "option_type": opt,
+                   "symbol": f"NSE:NIFTY26N1725300{opt}",
+                   "oi": oi, "ltp": _bs_price(spot, strike, tte, 0.13, is_call)}
+            if greeks:
+                row["greeks"] = {"iv": iv, "delta": 0.5, "gamma": 0.01,
+                                 "theta": -1.0, "vega": 1.0}
+            elif iv is not None:
+                row["iv"] = iv
+            rows.append(row)
+    return rows
+
+
+def test_flat_fyers_chain_parses_to_real_gex():
+    """The run #56 failure, replayed: flat rows, greeks IV present."""
+    class FlatChain:
+        def optionchain(self, data):
+            return {"s": "ok", "data": {"optionsChain": _flat_rows(25455.90, 0.002)}}
+
+    snap = compute_gex_snapshot(FlatChain(), 25455.90, date(2026, 11, 24))
+    assert snap is not None
+    assert snap.net_gex != 0.0
+    assert snap.call_wall == 25500  # highest call OI
+    assert snap.put_wall == 25400   # highest put OI
+    assert snap.pcr == 1.06         # put OI 1,800,000 / call OI 1,700,000
+    assert snap.max_pain in (25300, 25350, 25400, 25450, 25500, 25550, 25600)
+    assert snap.gamma_flip_level != 25455.90
+
+
+def test_flat_chain_index_row_skipped_and_legs_grouped():
+    parsed = _parse_chain_rows(_flat_rows(25455.90, 0.002))
+    assert [d.strike for d in parsed] == [25300, 25350, 25400, 25450, 25500, 25550, 25600]
+    atm = parsed[3]
+    assert atm.call_oi == 350000 and atm.put_oi == 400000
+    assert atm.call_iv == 0.13 and atm.put_iv == 0.13
+    assert atm.call_ltp > 0 and atm.put_ltp > 0
+
+
+def test_flat_chain_without_greeks_derives_iv_from_ltp():
+    """No greeks object at all: IV is derived from each leg's LTP."""
+    class FlatNoGreeks:
+        def optionchain(self, data):
+            return {"s": "ok", "data": {"optionsChain": _flat_rows(25455.90, 0.002, greeks=False)}}
+
+    snap = compute_gex_snapshot(FlatNoGreeks(), 25455.90, date(2026, 11, 24))
+    assert snap is not None
+    assert snap.net_gex != 0.0
+
+
+def test_flat_chain_requests_greeks_and_expiry_timestamp():
+    """The fetch asks for greeks=1 and pins the chain to the expiry."""
+    seen = []
+
+    class RecordingChain:
+        def optionchain(self, data):
+            seen.append(dict(data))
+            return {"s": "ok", "data": {"optionsChain": _flat_rows(25455.90, 0.002)}}
+
+    snap = compute_gex_snapshot(RecordingChain(), 25455.90, date(2026, 11, 24))
+    assert snap is not None
+    assert seen, "optionchain was never called"
+    first = seen[0]
+    assert first["greeks"] == "1"
+    expected_ts = str(int(datetime(2026, 11, 24, 15, 30, tzinfo=IST).timestamp()))
+    assert first["timestamp"] == expected_ts
+
+
+def test_flat_chain_timestamp_failure_falls_back_to_default_expiry():
+    """A rejected timestamp must not leave the engine with no chain."""
+    class FlakyChain:
+        def optionchain(self, data):
+            if "timestamp" in data:
+                raise RuntimeError("Please provide valid inputs")
+            return {"s": "ok", "data": {"optionsChain": _flat_rows(25455.90, 0.002)}}
+
+    snap = compute_gex_snapshot(FlakyChain(), 25455.90, date(2026, 11, 24))
+    assert snap is not None
+    assert snap.net_gex != 0.0
