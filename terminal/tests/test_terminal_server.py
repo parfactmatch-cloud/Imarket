@@ -121,6 +121,30 @@ class TestEngineEndpoint(unittest.TestCase):
         self.assertEqual(data["chainLog"]["maxPain"], 25200)
         self.assertEqual(data["engine"]["feed"], "fyers")
 
+    def test_engine_push_stores_positions_and_terminal_exposes_them(self):
+        # The close job reads open positions from GET /api/terminal.
+        payload = self._engine_payload()
+        payload["positions"] = [{"symbol": "NSE:NIFTY26NOV25300CE", "qty": 75,
+                                 "entry_price": 100.0, "status": "OPEN"}]
+        status, body = self._request("/api/engine", method="POST",
+                                     body=payload, token="test-token-123")
+        self.assertEqual(status, 200)
+        self.assertTrue(body["ok"])
+        stored = json.loads((self.data_dir / "engine.json").read_text())
+        self.assertEqual(stored["positions"], payload["positions"])
+        _, data = self._request("/api/terminal")
+        self.assertEqual(data["engine"]["positions"], payload["positions"])
+        self.assertEqual(data["engine"]["tradingDate"], "2026-11-17")
+        self.assertEqual(data["engine"]["feed"], "fyers")
+
+    def test_engine_push_without_positions_leaves_field_out(self):
+        status, _ = self._request("/api/engine", method="POST",
+                                  body=self._engine_payload(),
+                                  token="test-token-123")
+        self.assertEqual(status, 200)
+        stored = json.loads((self.data_dir / "engine.json").read_text())
+        self.assertNotIn("positions", stored)
+
     def test_stale_engine_push_falls_back_to_snapshot(self):
         self._request("/api/engine", method="POST",
                       body=self._engine_payload(), token="test-token-123")

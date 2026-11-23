@@ -71,6 +71,32 @@ class TestBuildEnginePayload(unittest.TestCase):
         self.assertNotIn("maxPain", payload)
         self.assertNotIn("bars", payload)
 
+    def test_positions_carried_when_given(self):
+        # The close job reads open positions from this field.
+        position = {"symbol": "NSE:NIFTY26NOV25300CE", "qty": 75,
+                    "entry_price": 100.0, "status": "OPEN"}
+        payload = build_engine_payload(
+            spot=25400.0, pdh=25337.6, pdl=25172.1, pdc=25291.1,
+            week_poc=25131.55, gex_snapshot=None, expiry=date(2026, 11, 17),
+            bars=[], trading_date=date(2026, 11, 17), positions=[position])
+        self.assertEqual(payload["positions"], [position])
+
+    def test_empty_positions_list_is_kept(self):
+        # [] means "already closed" to the close job; it must not be
+        # dropped the way a None value is.
+        payload = build_engine_payload(
+            spot=25400.0, pdh=25337.6, pdl=25172.1, pdc=25291.1,
+            week_poc=25131.55, gex_snapshot=None, expiry=date(2026, 11, 17),
+            bars=[], trading_date=date(2026, 11, 17), positions=[])
+        self.assertEqual(payload["positions"], [])
+
+    def test_positions_absent_when_not_given(self):
+        payload = build_engine_payload(
+            spot=25400.0, pdh=25337.6, pdl=25172.1, pdc=25291.1,
+            week_poc=25131.55, gex_snapshot=None, expiry=date(2026, 11, 17),
+            bars=[], trading_date=date(2026, 11, 17))
+        self.assertNotIn("positions", payload)
+
 
 class TestPushEngineSnapshot(unittest.TestCase):
     def test_posts_json_with_token_header(self):

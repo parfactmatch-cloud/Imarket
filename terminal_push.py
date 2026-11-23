@@ -7,7 +7,14 @@ to the terminal's ``/api/engine`` endpoint:
 
     {spot, asOf, tradingDate, pdh, pdl, pdc, weekPoc,
      callWall, putWall, gammaFlip, regime, maxPain, pcr, expiryDate,
-     bars: [{t, o, h, l, c}, ...]}
+     positions, bars: [{t, o, h, l, c}, ...]}
+
+``positions`` is the engine's open positions (serialised
+PositionState dicts, possibly empty). The close job reads them from
+the terminal: the engine's SQLite state store is fresh on every
+Actions runner, so the snapshot is the only state the close job can
+see. An empty list means "already closed" — the close job then sends
+nothing at all.
 
 The terminal shows that data with a "Fyers engine feed" label while it is
 fresh (under 10 minutes old) and falls back to its Yahoo snapshots when
@@ -70,8 +77,13 @@ def bars_to_chart_bars(bars, trading_date) -> list:
 
 def build_engine_payload(*, spot, pdh, pdl, pdc, week_poc,
                          gex_snapshot, expiry, bars,
-                         trading_date) -> dict:
-    """Assemble the /api/engine payload. ``None`` values are omitted."""
+                         trading_date, positions=None) -> dict:
+    """Assemble the /api/engine payload. ``None`` values are omitted.
+
+    ``positions`` is a list of serialised PositionState dicts (or
+    None to leave the field out). An empty list is sent as-is: it is
+    how the close job tells "already closed" from "field missing".
+    """
     payload = {
         "spot": round(float(spot), 2),
         "asOf": datetime.now(timezone.utc).isoformat(),
@@ -82,6 +94,8 @@ def build_engine_payload(*, spot, pdh, pdl, pdc, week_poc,
         "weekPoc": round(float(week_poc), 2) if week_poc is not None else None,
         "expiryDate": expiry.isoformat() if expiry is not None else None,
     }
+    if positions is not None:
+        payload["positions"] = [dict(p) for p in positions]
     if gex_snapshot is not None:
         payload["callWall"] = float(gex_snapshot.call_wall)
         payload["putWall"] = float(gex_snapshot.put_wall)
