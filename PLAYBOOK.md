@@ -32,7 +32,10 @@ trades with real money unless you explicitly set `PAPER_MODE=False`.
 5. **15:20 IST** — **End-of-Day Square-Off**: all open positions closed
    at market (or "No open positions to square off").
 6. **15:30 IST** — **Session Closed**: final Nifty spot and session CVD.
-   The run should then finish.
+   Then **Post-Market Playbook**: today's levels (walls, max pain, PCR,
+   gamma flip) and tomorrow's PDH/PDL/PDC, bias and next expiry — the
+   record of the day, sent even on a no-signal day. The run should then
+   finish.
 
 ## Telegram commands
 
@@ -62,6 +65,7 @@ value at the moment it was sent, so no two cards carry the same stale feed.
 | **Position Update** | An exit fired: stop-loss, target 1, target 2, or breakeven move. | None, unless the action reads FAILED — then check the run log. |
 | **End-of-Day Square-Off** | 15:20 IST close-out. | None. |
 | **Session Closed** | Market closed 3:30 PM IST. Final spot + session CVD, in the card. | None. Day is done. |
+| **Post-Market Playbook** | 15:30 IST, right after Session Closed. Today's close, day range, call/put walls, max pain/PCR, gamma flip/regime, and tomorrow's PDH/PDL/PDC, bias and next expiry. "n/a — GEX unavailable" means the chain gave no gamma that day. | Read it for tomorrow's levels. If walls read n/a, check the run log's "Option chain shape" line. |
 | **System Shutdown** | Engine manually terminated. | Only appears if someone stopped it. |
 
 ## Auth failures — step by step
