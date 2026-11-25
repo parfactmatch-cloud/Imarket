@@ -149,9 +149,13 @@ def _flat_rows(spot, tte, iv=0.13, greeks=True):
                                (25600, 150000, 80000)]:
         for opt, oi in (("CE", c_oi), ("PE", p_oi)):
             is_call = opt == "CE"
+            ltp = _bs_price(spot, strike, tte, 0.13, is_call)
             row = {"strike_price": strike, "option_type": opt,
                    "symbol": f"NSE:NIFTY26N1725300{opt}",
-                   "oi": oi, "ltp": _bs_price(spot, strike, tte, 0.13, is_call)}
+                   "oi": oi, "oich": oi // 10, "oichp": 10.0,
+                   "prev_oi": oi - oi // 10, "volume": oi // 5,
+                   "ltp": ltp, "bid": max(0.05, round(ltp - 0.25, 2)),
+                   "ask": round(ltp + 0.25, 2)}
             if greeks:
                 row["greeks"] = {"iv": iv, "delta": 0.5, "gamma": 0.01,
                                  "theta": -1.0, "vega": 1.0}
@@ -226,3 +230,79 @@ def test_flat_chain_timestamp_failure_falls_back_to_default_expiry():
     snap = compute_gex_snapshot(FlakyChain(), 25455.90, date(2026, 11, 24))
     assert snap is not None
     assert snap.net_gex != 0.0
+
+
+# ------------------------------------------------- step 1: chain fields (25 Nov 2026)
+def test_flat_chain_carries_oich_volume_bid_ask_and_greeks():
+    """The fields Fyers already sends are parsed, not dropped."""
+    parsed = _parse_chain_rows(_flat_rows(25455.90, 0.002))
+    atm = parsed[3]  # 25450, nearest spot
+    assert atm.call_oich == 35000 and atm.put_oich == 40000
+    assert atm.call_prev_oi == 315000 and atm.put_prev_oi == 360000
+    assert atm.call_volume == 70000 and atm.put_volume == 80000
+    assert atm.call_bid > 0 and atm.call_ask > atm.call_bid
+    assert atm.call_delta == 0.5 and atm.call_gamma == 0.01
+    assert atm.call_theta == -1.0 and atm.call_vega == 1.0
+
+
+def test_oi_change_pcr_and_atm_spreads():
+    """OI-change PCR from oich; ATM spreads from bid/ask (0.50 each)."""
+    class FlatChain:
+        def optionchain(self, data):
+            return {"s": "ok", "data": {"optionsChain": _flat_rows(25455.90, 0.002)}}
+
+    snap = compute_gex_snapshot(FlatChain(), 25455.90, date(2026, 11, 24))
+    assert snap is not None
+    # put oich 180,000 / call oich 170,000
+    assert snap.pcr_oi_change == 1.06
+    assert snap.atm_call_spread == 0.5
+    assert snap.atm_put_spread == 0.5
+
+
+def test_fyers_gamma_used_when_present_and_bsm_otherwise():
+    """Fyers' own gamma replaces the BSM estimate; without it BSM runs."""
+    class FlatChain:
+        def optionchain(self, data):
+            return {"s": "ok", "data": {"optionsChain": _flat_rows(25455.90, 0.002)}}
+
+    snap = compute_gex_snapshot(FlatChain(), 25455.90, date(2026, 11, 24))
+    assert snap.fyers_gamma_legs == 14  # 7 strikes x 2 legs
+    # gamma 0.01 on every leg: net = 0.01*75*spot*0.01*(put_oi-call_oi)
+    # = 190.92 * 100,000 ≈ +19.09m — far outside any BSM-scale reading.
+    assert snap.net_gex > 10_000_000
+
+    class FlatNoGamma:
+        def optionchain(self, data):
+            rows = _flat_rows(25455.90, 0.002)
+            for row in rows:
+                row.get("greeks", {}).pop("gamma", None)
+            return {"s": "ok", "data": {"optionsChain": rows}}
+
+    snap_bsm = compute_gex_snapshot(FlatNoGamma(), 25455.90, date(2026, 11, 24))
+    assert snap_bsm.fyers_gamma_legs == 0
+    assert snap_bsm.net_gex != 0.0
+    assert abs(snap_bsm.net_gex) < 5_000_000  # BSM-scale gamma
+
+
+def test_india_vix_and_expiry_dates_carried_on_snapshot():
+    """indiavixData and expiryData from the response land on the snapshot."""
+    class FlatChain:
+        def optionchain(self, data):
+            return {"s": "ok", "data": {
+                "optionsChain": _flat_rows(25455.90, 0.002),
+                "indiavixData": {"ltp": 17.31},
+                "expiryData": [{"date": "01-12-2026", "expiry": 1796104200},
+                               {"date": "08-12-2026", "expiry": 1796709000}]}}
+
+    snap = compute_gex_snapshot(FlatChain(), 25455.90, date(2026, 11, 24))
+    assert snap is not None
+    assert snap.india_vix == 17.31
+    assert snap.expiry_dates == (date(2026, 12, 1), date(2026, 12, 8))
+
+
+def test_spread_blocks_trade_only_when_measured_and_too_wide():
+    from market_data import spread_blocks_trade
+    assert spread_blocks_trade(0.0, 1.0) is False   # unknown spread: never blocks
+    assert spread_blocks_trade(0.5, 1.0) is False
+    assert spread_blocks_trade(1.0, 1.0) is False   # at the threshold: allowed
+    assert spread_blocks_trade(1.5, 1.0) is True

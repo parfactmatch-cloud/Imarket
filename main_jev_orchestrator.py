@@ -52,7 +52,11 @@ from expiry import next_weekly_expiry, option_symbol
 from fyers_auth_automation import FyersAuthManager
 from lag_neutralized_engine import LagNeutralizedEngine, FastBar
 from advanced_auction_footprint_engine import AdvancedAuctionFootprintEngine
-from market_data import compute_gex_snapshot, get_option_quote
+from market_data import (INDIA_VIX_SYMBOL, check_market_open,
+                         compute_gex_snapshot, fetch_option_history,
+                         get_batch_quotes, get_market_depth,
+                         get_option_quote, spread_blocks_trade,
+                         validate_weekly_symbol)
 from position_monitor import PositionMonitor
 from telegram_remote_controller import TelegramController
 from terminal_push import build_engine_payload, push_engine_snapshot
@@ -268,6 +272,68 @@ def _is_closed_database_error(msg):
     return "closed database" in str(msg).lower()
 
 
+class LegTickTracker:
+    """Latest price + current-bar ticks for subscribed option legs.
+
+    The Data Socket carries no OI/IV/Greeks, so legs are tracked for
+    pricing only: the latest LTP feeds the quote path, and each
+    5-minute bar closes into a per-leg FastBar. The REST chain poll
+    stays the source for GEX (step 2, 25 Nov 2026).
+    """
+
+    def __init__(self):
+        self.state = {}  # symbol -> {"ltp","bid","ask","at","ticks"}
+        self.bars = {}   # symbol -> [FastBar] (last 100 each)
+
+    def track(self, symbol, ltp, bid, ask, qty, now=None):
+        """Record one leg tick. Unknown symbols are ignored: only legs
+        the engine subscribed to are tracked."""
+        state = self.state.setdefault(
+            symbol, {"ltp": ltp, "bid": ltp, "ask": ltp,
+                     "at": 0.0, "ticks": []})
+        state["ltp"] = float(ltp)
+        state["bid"] = float(bid)
+        state["ask"] = float(ask)
+        state["at"] = time.time() if now is None else now
+        state["ticks"].append((float(ltp), int(qty)))
+        if len(state["ticks"]) > 1000:
+            del state["ticks"][:-1000]
+
+    def latest_ltp(self, symbol, max_age_seconds=120, now=None):
+        """Fresh socket LTP for ``symbol``, or None when absent/stale.
+
+        Staleness matters: a socket that dropped mid-session must not
+        keep serving its last price. Callers fall back to REST quotes.
+        """
+        state = self.state.get(symbol)
+        if not state:
+            return None
+        at = state["at"]
+        now = time.time() if now is None else now
+        if now - at > max_age_seconds:
+            return None
+        return state["ltp"]
+
+    def flush_bar(self, fast_bar: FastBar):
+        """Close one 5-minute bar per leg that ticked; clears tick lists."""
+        for symbol, state in self.state.items():
+            ticks = state["ticks"]
+            if not ticks:
+                continue
+            prices = [t[0] for t in ticks]
+            bars = self.bars.setdefault(symbol, [])
+            bars.append(FastBar(
+                timestamp=fast_bar.timestamp, open=prices[0],
+                high=max(prices), low=min(prices), close=prices[-1],
+                volume=sum(t[1] for t in ticks),
+                elapsed_seconds=fast_bar.elapsed_seconds))
+            if len(bars) > 100:
+                del bars[:-100]
+            state["ticks"] = []
+            logger.debug("Leg bar %s: %d ticks, close %.2f",
+                         symbol, len(prices), prices[-1])
+
+
 def _run_streaming_session(ws, shutdown_event, state_store):
     """Run the live socket session until the close watcher shuts it down.
 
@@ -358,8 +424,47 @@ def start_system():
         # Wire the authenticated client into the router (fix: it used
         # to stay None forever, making live execution unreachable).
         router.set_fyers_client(fyers)
-        quote_fn = lambda sym: get_option_quote(fyers, sym)  # noqa: E731
+        # Quote path (steps 2+3): the live socket's leg tick first
+        # (fresh within 2 minutes), then one batch-quotes call for the
+        # leg + spot + VIX, then the single-symbol quote. The leg
+        # tracker is created below, after the expiry is known, so it
+        # is reached through a holder filled in at that point.
+        leg_holder = {"tracker": None}
+
+        def quote_fn(sym: str):
+            tracker = leg_holder["tracker"]
+            if tracker is not None:
+                fresh = tracker.latest_ltp(sym)
+                if fresh is not None:
+                    return fresh
+            batch = get_batch_quotes(
+                fyers, [sym, "NSE:NIFTY50-INDEX", INDIA_VIX_SYMBOL])
+            if sym in batch:
+                logger.debug("Quote for %s from batch quotes (socket stale)", sym)
+                return batch[sym]
+            return get_option_quote(fyers, sym)
+
         router.set_quote_fn(quote_fn)
+        # Pre-trade depth check (step 5): the broker asks the live
+        # order book for the exact leg at signal time.
+        router.set_depth_fn(lambda sym: get_market_depth(fyers, sym))
+
+        # Market-status gate (step 6): do not start a session when
+        # Fyers positively reports the market closed (a late-scheduled
+        # run, a holiday the cron did not skip). Unknown status never
+        # blocks a run — it only warns.
+        status, detail = check_market_open(fyers)
+        if status == "closed":
+            logger.error("Market is closed (%s); engine idle", detail)
+            tg.send_alert("Market Closed -- Engine Idle",
+                          f"Fyers reports the market closed ({detail}). "
+                          "No trades today.")
+            state_store.close()
+            return
+        if status == "unknown":
+            logger.warning("Market status unknown (%s); proceeding", detail)
+        else:
+            logger.info("Market status: %s", detail)
 
         levels, levels_ok = fetch_historical_levels(fyers)
         if not levels_ok:
@@ -404,6 +509,27 @@ def start_system():
         fp_engine = AdvancedAuctionFootprintEngine(tick_size=0.05, imbalance_ratio=3.0, stacked_count=3)
         monitor = PositionMonitor(state_store, router, quote_fn=quote_fn, config=config)
 
+        # Step 2: leg subscriptions. The ATM CE/PE legs are subscribed
+        # at session start; the traded leg is added when a position
+        # opens (see _buy_option). Spot + 2 ATM legs + 1 traded leg
+        # stays far under the 100-symbol Standard socket cap.
+        atm_strike_start = round(pdc / 50) * 50
+        subscribed_legs = {
+            option_symbol("NIFTY", expiry, atm_strike_start, "CE"),
+            option_symbol("NIFTY", expiry, atm_strike_start, "PE"),
+        }
+        leg_tracker = LegTickTracker()
+        leg_holder["tracker"] = leg_tracker
+
+        # Step 4: seed option-premium bars for the ATM legs (history
+        # with oi_flag=1) and compute premium VWAP/ATR. A failure here
+        # only loses the seed stats — the spot bars still seed.
+        option_seed = {}
+        for leg_sym in sorted(subscribed_legs):
+            seed = fetch_option_history(fyers, leg_sym)
+            if seed is not None:
+                option_seed[leg_sym] = seed
+
 
         bar_ticks = []
         bars_5m_history = fetch_5m_history(fyers)
@@ -416,14 +542,43 @@ def start_system():
         gex_cache = {"value": None, "at": 0.0}  # caches the GEXSnapshot
 
         def get_gex_snapshot(spot: float):
-            """Cached GEX snapshot; None when the chain cannot be fetched."""
-            if time.time() - gex_cache["at"] < BAR_SECONDS and gex_cache["at"] != 0.0:
+            """Cached GEX snapshot; None when the chain cannot be fetched.
+
+            Re-fetched every config.gex_poll_seconds (60 s): ~375
+            calls/day on the Standard plan's 5,000/day data budget.
+            Every fetched chain is archived (step 4).
+            """
+            if time.time() - gex_cache["at"] < config.gex_poll_seconds and gex_cache["at"] != 0.0:
                 return gex_cache["value"]
-            value = compute_gex_snapshot(fyers, spot, expiry)
+            value = compute_gex_snapshot(fyers, spot, expiry, archive=True)
             gex_cache["value"] = value
             gex_cache["at"] = time.time()
             if value is None:
                 logger.warning("Dealer gamma unavailable; signals will be HOLD until it is")
+            return value
+
+        wide_gex_cache = {"value": None, "at": 0.0}
+
+        def get_wide_gex_snapshot(spot: float):
+            """Second, slower poll (step 7): strikecount=50, next expiry.
+
+            ~75 calls/day on top of the narrow poll — inside the
+            Standard 5,000/day budget. Context only: it never gates a
+            signal; it is logged and shown on the playbook card.
+            """
+            if time.time() - wide_gex_cache["at"] < 300 and wide_gex_cache["at"] != 0.0:
+                return wide_gex_cache["value"]
+            next_expiry = next_weekly_expiry(now=expiry + timedelta(days=1))
+            value = compute_gex_snapshot(fyers, spot, next_expiry,
+                                         strikecount=50, archive=True)
+            wide_gex_cache["value"] = value
+            wide_gex_cache["at"] = time.time()
+            if value is not None:
+                logger.info("Wide GEX (expiry %s): net_dex=%.2f call_wall=%.0f "
+                            "put_wall=%.0f max_pain=%.0f pcr=%.2f",
+                            next_expiry.isoformat(), value.net_gex,
+                            value.call_wall, value.put_wall,
+                            value.max_pain, value.pcr)
             return value
 
         def get_dealer_net_dex(spot: float):
@@ -470,6 +625,10 @@ def start_system():
             bar_ticks.clear()
             bar_start_time = time.time()
             early_triggered_this_bar = False
+            leg_tracker.flush_bar(fast_bar)
+            # Wide-chain poll (step 7): cached at 5 min, so this call
+            # is a no-op on most bars.
+            get_wide_gex_snapshot(fast_bar.close)
             _push_to_terminal(fast_bar.close)
 
         def _premium_levels(premium: float):
@@ -482,8 +641,10 @@ def start_system():
             nonlocal early_triggered_this_bar
             atm_strike = round(fast_bar.close / 50) * 50
             symbol = option_symbol("NIFTY", expiry, atm_strike, option_type)
-            # Price off the OPTION premium, never the NIFTY spot.
-            premium = get_option_quote(fyers, symbol)
+            # Price off the OPTION premium, never the NIFTY spot: the
+            # socket's live leg tick first, batch quotes, then a single
+            # REST quote (see quote_fn above).
+            premium = quote_fn(symbol)
             if premium is None:
                 logger.error("No option quote for %s; trade skipped", symbol)
                 tg.send_alert("Quote Unavailable", f"No quote for {symbol}; trade skipped.")
@@ -494,6 +655,35 @@ def start_system():
             # Same cached snapshot the signal decision used, so the walls
             # printed are the walls the trade was judged against.
             snapshot = get_gex_snapshot(fast_bar.close)
+            # Spread filter (step 1): the chain's own bid/ask on the ATM
+            # leg. A spread wider than the config threshold means the
+            # quote cannot be trusted for an entry; skip the trade.
+            # A 0.0 spread means the chain carried no bid/ask -- unknown,
+            # not a zero spread -- so it never blocks here; the broker's
+            # live depth check (step 5) is the guard for that case.
+            spread = 0.0
+            if snapshot is not None:
+                spread = (snapshot.atm_call_spread if option_type == "CE"
+                          else snapshot.atm_put_spread)
+            if spread_blocks_trade(spread, config.max_option_spread_rs):
+                logger.warning("[Veto] %s spread Rs %.2f > max Rs %.2f; trade skipped",
+                              symbol, spread, config.max_option_spread_rs)
+                tg.send_alert("Spread Too Wide",
+                              f"{symbol} spread Rs {spread:.2f} > "
+                              f"Rs {config.max_option_spread_rs:.2f}; trade skipped.")
+                return
+            # Symbol validation (step 6): the built symbol must match
+            # an expiry Fyers lists and a strike on the fetched chain.
+            # The formatted symbol stands when there is nothing to
+            # check against (no snapshot), so this never blocks on a
+            # missing feed — only on a positive mismatch.
+            ok, why = validate_weekly_symbol(snapshot, symbol, expiry, atm_strike)
+            if not ok:
+                logger.error("Symbol validation failed for %s: %s; trade skipped",
+                             symbol, why)
+                tg.send_alert("Symbol Validation Failed",
+                              f"{symbol}: {sanitize_tg_text(why)}; trade skipped.")
+                return
             tg.send_card(
                 f"NIFTY {'BUY' if option_type == 'CE' else 'SELL'} SIGNAL",
                 _signal_alert_details(
@@ -516,8 +706,27 @@ def start_system():
                 tg.send_alert("Order Rejected", f"{symbol}: {sanitize_tg_text(result.reason)}")
             else:
                 early_triggered_this_bar = True
+                _subscribe_leg(symbol)
                 logger.info("Buy %s x%d @ premium %.2f status=%s",
                             symbol, config.lot_size, premium, result.status)
+
+        def _subscribe_leg(symbol: str) -> None:
+            """Subscribe one option leg on the live socket (step 2).
+
+            Best-effort: a failed subscribe never blocks trading — the
+            REST quote path still prices the leg.
+            """
+            if symbol in subscribed_legs:
+                return
+            subscribed_legs.add(symbol)
+            ws = ws_holder["ws"]
+            if ws is None:
+                return
+            try:
+                ws.subscribe(symbols=[symbol], data_type="symbolUpdate")
+                logger.info("[WS] Subscribed traded leg %s", symbol)
+            except Exception as exc:
+                logger.warning("[WS] Leg subscribe failed for %s: %s", symbol, exc)
 
         def evaluate_and_execute(elapsed_sec: int, is_early: bool):
             nonlocal bar_ticks, bar_start_time, early_triggered_this_bar
@@ -596,6 +805,17 @@ def start_system():
             if not ltp:
                 return
             ltp = float(ltp)
+            # Leg ticks are routed by symbol: they price the legs, and
+            # must never feed the spot bars or CVD. A message without a
+            # symbol is treated as the spot tick (the old behaviour).
+            sym = message.get("symbol") or "NSE:NIFTY50-INDEX"
+            if sym != "NSE:NIFTY50-INDEX":
+                if sym in subscribed_legs:
+                    leg_tracker.track(
+                        sym, ltp,
+                        message.get("bid", ltp), message.get("ask", ltp),
+                        message.get("last_traded_qty", 1))
+                return
             latest_ltp = ltp
             qty = int(message.get("last_traded_qty", 1))
             bid = float(message.get("bid", ltp))
@@ -645,10 +865,11 @@ def start_system():
             logger.info("[WS Closed] %s", msg)
 
         def on_open():
-            logger.info("[WS Connected] Subscribing to NSE:NIFTY50-INDEX...")
+            logger.info("[WS Connected] Subscribing to NSE:NIFTY50-INDEX + ATM legs...")
             ws = ws_holder["ws"]
             if ws is not None:
-                ws.subscribe(symbols=["NSE:NIFTY50-INDEX"], data_type="symbolUpdate")
+                ws.subscribe(symbols=["NSE:NIFTY50-INDEX"] + sorted(subscribed_legs),
+                             data_type="symbolUpdate")
                 ws.keep_running()
 
         def _parse_hhmm(value: str):
@@ -682,8 +903,35 @@ def start_system():
                     walls = f"{gex.call_wall:,.0f} / {gex.put_wall:,.0f}"
                     pain = f"{gex.max_pain:,.0f} / {gex.pcr:.2f}"
                     flip = f"{gex.gamma_flip_level:,.2f} / {gex.market_regime}"
+                    vix = (f"{gex.india_vix:.2f}" if gex.india_vix
+                           else "n/a — not carried")
                 else:
                     walls = pain = flip = "n/a — GEX unavailable"
+                    vix = "n/a — GEX unavailable"
+                # Next-week walls from the wide chain (step 7) and the
+                # ATM premium VWAP/ATR seeded at the open (step 4).
+                wide = None
+                try:
+                    wide = get_wide_gex_snapshot(latest_ltp)
+                except Exception as exc:
+                    logger.warning("Playbook wide-GEX read failed: %s", exc)
+                if wide is not None:
+                    next_expiry = next_weekly_expiry(now=expiry + timedelta(days=1))
+                    wide_walls = (f"C {wide.call_wall:,.0f} / P {wide.put_wall:,.0f} "
+                                  f"({next_expiry.strftime('%d %b')})")
+                else:
+                    wide_walls = "n/a — wide chain unavailable"
+                vwap_parts = []
+                for opt in ("CE", "PE"):
+                    sym = option_symbol("NIFTY", expiry, atm_strike_start, opt)
+                    seed = option_seed.get(sym)
+                    if seed and seed.get("vwap") is not None:
+                        part = f"{opt} ₹{seed['vwap']:.2f}"
+                        if seed.get("atr") is not None:
+                            part += f" (ATR ₹{seed['atr']:.2f})"
+                        vwap_parts.append(part)
+                vwap_row = (" / ".join(vwap_parts) if vwap_parts
+                            else "n/a — no option history")
                 tg.send_card(
                     "Post-Market Playbook",
                     [
@@ -692,6 +940,9 @@ def start_system():
                         ("Call wall / Put wall", walls),
                         ("Max pain / PCR", pain),
                         ("Gamma flip / Regime", flip),
+                        ("India VIX", vix),
+                        ("Next week walls", wide_walls),
+                        ("ATM premium VWAP", vwap_row),
                         ("Tomorrow PDH / PDL", f"{today_high:,.2f} / {today_low:,.2f}"),
                         ("Tomorrow PDC / Bias", f"{latest_ltp:,.2f} / {bias}"),
                         ("Next expiry", expiry.strftime("%a %d %b %Y")),

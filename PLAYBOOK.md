@@ -21,7 +21,12 @@ trades with real money unless you explicitly set `PAPER_MODE=False`.
 
 1. **09:15 IST** — run starts. Auth takes ~2 seconds (run #46: 11:12:20–11:12:21 UTC).
 2. Engine fetches real levels (PDH / PDL / Week POC), seeds 75 completed
-   5-minute bars, connects the Fyers WebSocket, subscribes to `NSE:NIFTY50-INDEX`.
+   5-minute bars, connects the Fyers WebSocket, subscribes to `NSE:NIFTY50-INDEX`
+   **and the ATM CE/PE legs** (leg ticks give fresh premiums; the REST
+   chain poll every 60 s still supplies OI and Greeks, which the socket
+   cannot carry). It also seeds option-premium history (VWAP/ATR) for the
+   ATM legs. If Fyers positively reports the market closed, the run sends
+   **Market Closed — Engine Idle** and stops — it does not trade.
 3. Telegram: **System Online (Live Feed)** — "Jev Engine (Paper Mode) …
    Status: Live Scanning". This is the "all good" message.
 4. All day: the engine scans. A signal needs all five conditions
@@ -33,9 +38,9 @@ trades with real money unless you explicitly set `PAPER_MODE=False`.
    at market (or "No open positions to square off").
 6. **15:30 IST** — **Session Closed**: final Nifty spot and session CVD.
    Then **Post-Market Playbook**: today's levels (walls, max pain, PCR,
-   gamma flip) and tomorrow's PDH/PDL/PDC, bias and next expiry — the
-   record of the day, sent even on a no-signal day. The run should then
-   finish.
+   gamma flip, India VIX, next-week walls, ATM premium VWAP) and tomorrow's
+   PDH/PDL/PDC, bias and next expiry — the record of the day, sent even on
+   a no-signal day. The run should then finish.
 
 ## Telegram commands
 
@@ -61,11 +66,14 @@ value at the moment it was sent, so no two cards carry the same stale feed.
 | **Levels Unavailable — Trading Paused** | Real levels could not be fetched. Engine paused itself rather than trade on stale defaults. | None today. Check the next run; do not force a trade. |
 | **NIFTY BUY / SELL SIGNAL** | All five conditions + gamma confirmed; an order was placed (paper). Shows spot, premium, SL/T1/T2, walls and Week POC. | Check the **Position Update** that follows. |
 | **Order Rejected: …** | The router refused the order; the reason is in the message (usually a risk limit). | Read the reason. If it is a risk limit, that is the system working. |
+| **Spread Too Wide** | The option's bid/ask spread was wider than the config limit (default ₹1.00); the trade was skipped. The broker also checks the live order book before every buy. | None. The next signal tries again. If it happens all day, the leg is genuinely illiquid. |
+| **Symbol Validation Failed** | The built weekly option symbol did not match the expiry or strike Fyers lists on the chain; the trade was skipped. | Check the run log — usually a wrong expiry or an ATM strike off the chain. Do not force the trade. |
+| **Market Closed — Engine Idle** | Fyers reported the market closed at startup (late-scheduled run or a holiday the cron did not skip). The engine did not trade. | None. Check the date against the NSE holiday list. |
 | **Quote Unavailable** | No live quote for the option symbol; trade skipped. | None. It will try again on the next signal. |
 | **Position Update** | An exit fired: stop-loss, target 1, target 2, or breakeven move. | None, unless the action reads FAILED — then check the run log. |
 | **End-of-Day Square-Off** | 15:20 IST close-out. | None. |
 | **Session Closed** | Market closed 3:30 PM IST. Final spot + session CVD, in the card. | None. Day is done. |
-| **Post-Market Playbook** | 15:30 IST, right after Session Closed. Today's close, day range, call/put walls, max pain/PCR, gamma flip/regime, and tomorrow's PDH/PDL/PDC, bias and next expiry. "n/a — GEX unavailable" means the chain gave no gamma that day. | Read it for tomorrow's levels. If walls read n/a, check the run log's "Option chain shape" line. |
+| **Post-Market Playbook** | 15:30 IST, right after Session Closed. Today's close, day range, call/put walls, max pain/PCR, gamma flip/regime, India VIX, next-week walls and ATM premium VWAP, and tomorrow's PDH/PDL/PDC, bias and next expiry. "n/a — GEX unavailable" means the chain gave no gamma that day. | Read it for tomorrow's levels. If walls read n/a, check the run log's "Option chain shape" line. |
 | **System Shutdown** | Engine manually terminated. | Only appears if someone stopped it. |
 
 ## Auth failures — step by step

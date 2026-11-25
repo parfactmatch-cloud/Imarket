@@ -89,6 +89,15 @@ class JevConfig:
     # it. The token must match the terminal's JEV_TERMINAL_TOKEN env var.
     terminal_url: str = ""
     terminal_token: str = ""
+    # Bid/ask-spread entry filter (steps 1 and 5, 25 Nov 2026): a trade
+    # is skipped when the option leg's spread is wider than this, in
+    # rupees. A leg with no bid/ask on the feed never blocks on spread
+    # alone — the live depth check is the guard for that case.
+    max_option_spread_rs: float = 1.0
+    # How often the narrow (strikecount=15) chain is re-fetched, in
+    # seconds (step 4). 60 s = ~375 calls/day on the Standard plan's
+    # 5,000/day data budget; the wide chain (step 7) polls every 5 min.
+    gex_poll_seconds: int = 60
 
     @classmethod
     def from_env(cls) -> "JevConfig":
@@ -105,4 +114,6 @@ class JevConfig:
             log_level=os.environ.get("LOG_LEVEL", "INFO").strip(),
             terminal_url=os.environ.get("JEV_TERMINAL_URL", "").strip(),
             terminal_token=os.environ.get("JEV_TERMINAL_TOKEN", "").strip(),
+            max_option_spread_rs=_env_float("MAX_OPTION_SPREAD_RS", 1.0),
+            gex_poll_seconds=_env_int("GEX_POLL_SECONDS", 60),
         )
