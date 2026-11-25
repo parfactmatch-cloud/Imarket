@@ -22,6 +22,31 @@ class OptionStrikeData:
     put_iv: float
     call_ltp: float
     put_ltp: float
+    # Fields Fyers already sends on every chain row (step 1, 25 Nov 2026):
+    # OI change / previous OI / volume / bid / ask per leg, plus the full
+    # Greeks when greeks=1 was requested. All default to 0 so older
+    # callers (and the nested-shape tests) keep working; 0 means "not
+    # carried by this feed", never a measured zero.
+    call_oich: int = 0
+    put_oich: int = 0
+    call_oichp: float = 0.0
+    put_oichp: float = 0.0
+    call_prev_oi: int = 0
+    put_prev_oi: int = 0
+    call_volume: int = 0
+    put_volume: int = 0
+    call_bid: float = 0.0
+    put_bid: float = 0.0
+    call_ask: float = 0.0
+    put_ask: float = 0.0
+    call_delta: float = 0.0
+    put_delta: float = 0.0
+    call_gamma: float = 0.0
+    put_gamma: float = 0.0
+    call_theta: float = 0.0
+    put_theta: float = 0.0
+    call_vega: float = 0.0
+    put_vega: float = 0.0
 
 
 @dataclass
@@ -38,6 +63,13 @@ class GEXSnapshot:
     zero_dte_squeeze_risk: bool
     max_pain: float = 0.0     # Strike minimising total option payout at expiry
     pcr: float = 0.0          # Total put OI / total call OI
+    pcr_oi_change: float = 0.0  # Total put OI change / total call OI change
+    atm_call_spread: float = 0.0  # ask-bid of the CE leg nearest spot (0 = unknown)
+    atm_put_spread: float = 0.0   # ask-bid of the PE leg nearest spot (0 = unknown)
+    india_vix: Optional[float] = None  # From the chain response, if carried
+    fyers_gamma_legs: int = 0  # Legs whose gamma came from Fyers, not BSM
+    expiry_dates: tuple = ()  # Expiry dates Fyers lists for this underlying
+    strikes: tuple = ()  # Strikes on the fetched chain (for validation)
 
 
 class IndiaGEXEngine:
@@ -135,7 +167,9 @@ class IndiaGEXEngine:
         underlying: str,
         spot_price: float,
         tte_years: float,
-        chain: List[OptionStrikeData]
+        chain: List[OptionStrikeData],
+        india_vix: Optional[float] = None,
+        expiry_dates=(),
     ) -> GEXSnapshot:
         lot_size = self.lot_sizes.get(underlying.upper(), 75)
 
@@ -145,8 +179,11 @@ class IndiaGEXEngine:
         net_gex_per_strike = []
         call_ois = []
         put_ois = []
+        call_oichs = []
+        put_oichs = []
 
         iv_sources = {"chain": 0, "ltp": 0, "fallback": 0}
+        fyers_gamma_legs = 0
 
         for data in chain:
             call_iv, call_src = self._resolve_iv(spot_price, data.strike, tte_years,
@@ -155,8 +192,19 @@ class IndiaGEXEngine:
                                                data.put_iv, data.put_ltp, is_call=False)
             iv_sources[call_src] += 1
             iv_sources[put_src] += 1
-            c_gamma = self.calculate_bs_gamma(spot_price, data.strike, tte_years, call_iv)
-            p_gamma = self.calculate_bs_gamma(spot_price, data.strike, tte_years, put_iv)
+            # Fyers' own gamma when the chain carries it (greeks=1);
+            # BSM gamma otherwise. Fyers gamma is the exchange's own
+            # model output for that leg, so it wins over our estimate.
+            if data.call_gamma and data.call_gamma > 0:
+                c_gamma = data.call_gamma
+                fyers_gamma_legs += 1
+            else:
+                c_gamma = self.calculate_bs_gamma(spot_price, data.strike, tte_years, call_iv)
+            if data.put_gamma and data.put_gamma > 0:
+                p_gamma = data.put_gamma
+                fyers_gamma_legs += 1
+            else:
+                p_gamma = self.calculate_bs_gamma(spot_price, data.strike, tte_years, put_iv)
 
             # Cash-Normalized Dealer Gamma (1% move impact)
             # Call side: Retail Buy -> Dealer Short Gamma (-1)
@@ -171,10 +219,17 @@ class IndiaGEXEngine:
             net_gex_per_strike.append(net_gex)
             call_ois.append(data.call_oi)
             put_ois.append(data.put_oi)
+            call_oichs.append(data.call_oich)
+            put_oichs.append(data.put_oich)
 
         total_call_gex = float(np.sum(call_gex_per_strike))
         total_put_gex = float(np.sum(put_gex_per_strike))
         aggregate_net_gex = total_call_gex + total_put_gex
+
+        if fyers_gamma_legs:
+            logger.info("GEX gamma: %d/%d legs from Fyers greeks, %d BSM",
+                        fyers_gamma_legs, len(chain) * 2,
+                        len(chain) * 2 - fyers_gamma_legs)
 
         if iv_sources["chain"] < len(chain) * 2:
             # Any leg not from the chain means the feed is omitting IV --
@@ -196,6 +251,28 @@ class IndiaGEXEngine:
         pcr = (total_put_oi / total_call_oi) if total_call_oi > 0 else 0.0
         max_pain = self._max_pain_strike(strikes, call_ois, put_ois)
 
+        # OI-change PCR: fresh positioning, not the standing stock of OI.
+        # Signed sums: a day when puts are being added and calls closed
+        # reads very differently from the plain PCR. Zero when the chain
+        # carries no OI change at all (or the call change nets to zero).
+        total_call_oich = float(sum(call_oichs))
+        total_put_oich = float(sum(put_oichs))
+        pcr_oi_change = ((total_put_oich / total_call_oich)
+                         if total_call_oich != 0 else 0.0)
+
+        # ATM spreads (ask-bid on the strike nearest spot). 0.0 means
+        # the chain carried no bid/ask -- unknown, not a zero spread.
+        def _spread(bid: float, ask: float) -> float:
+            return round(ask - bid, 2) if bid > 0 and ask > bid else 0.0
+
+        atm_call_spread = atm_put_spread = 0.0
+        if chain:
+            atm_idx = min(range(len(chain)),
+                          key=lambda i: abs(chain[i].strike - spot_price))
+            atm = chain[atm_idx]
+            atm_call_spread = _spread(atm.call_bid, atm.call_ask)
+            atm_put_spread = _spread(atm.put_bid, atm.put_ask)
+
         hours_to_expiry = tte_years * 252 * 6.25
         dist_to_call_wall = abs(spot_price - call_wall) / spot_price if spot_price > 0 else 0
         dist_to_put_wall = abs(spot_price - put_wall) / spot_price if spot_price > 0 else 0
@@ -214,6 +291,13 @@ class IndiaGEXEngine:
             zero_dte_squeeze_risk=is_0dte_squeeze,
             max_pain=round(max_pain, 2),
             pcr=round(pcr, 2),
+            pcr_oi_change=round(pcr_oi_change, 2),
+            atm_call_spread=atm_call_spread,
+            atm_put_spread=atm_put_spread,
+            india_vix=india_vix,
+            fyers_gamma_legs=fyers_gamma_legs,
+            expiry_dates=tuple(expiry_dates),
+            strikes=tuple(strikes),
         )
 
     @staticmethod

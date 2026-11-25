@@ -198,10 +198,15 @@ class TestCloseJobQuietPaths(unittest.TestCase):
 
     def test_login_failure_exits_nonzero_with_alert(self):
         tg = FakeTelegram()
+        # Pin the clock to the snapshot's trading day: without now_fn the
+        # job uses the real clock, so on any day after 23 Nov 2026 the
+        # snapshot looks stale and run() exits 0 before ever logging in.
+        clock = FakeClock(datetime(2026, 11, 23, 15, 16, tzinfo=IST))
         job = CloseJob(JevConfig(terminal_url="https://example.invalid"),
                        telegram=tg,
                        fetch_engine=lambda url: _engine(
-                           positions=[_position()]))
+                           positions=[_position()]),
+                       now_fn=clock.now)
         with mock.patch.object(CloseJob, "_login_fyers", return_value=None):
             self.assertEqual(job.run(), 1)
         self.assertEqual(len(tg.alerts), 1)

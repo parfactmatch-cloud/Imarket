@@ -54,12 +54,14 @@ class ExecutionRouter:
         paper_mode: bool = True,
         config: Optional[JevConfig] = None,
         quote_fn: Optional[Callable[[str], Optional[float]]] = None,
+        depth_fn: Optional[Callable[[str], Optional[dict]]] = None,
     ):
         self.fyers = fyers_client
         self.store = state_store
         self.paper_mode = paper_mode
         self.config = config or JevConfig()
         self.quote_fn = quote_fn
+        self.depth_fn = depth_fn
         self.virtual_cash = self.config.virtual_cash_initial
 
     # --- wiring -------------------------------------------------------
@@ -69,6 +71,10 @@ class ExecutionRouter:
 
     def set_quote_fn(self, quote_fn: Callable[[str], Optional[float]]) -> None:
         self.quote_fn = quote_fn
+
+    def set_depth_fn(self, depth_fn: Callable[[str], Optional[dict]]) -> None:
+        """Wire the market-depth function in after login (step 5)."""
+        self.depth_fn = depth_fn
 
     # --- helpers ------------------------------------------------------
     def _today_ist(self) -> str:
@@ -131,6 +137,33 @@ class ExecutionRouter:
                 return f"insufficient account balance: cost Rs {cost:.2f} > Rs {balance:.2f}"
         return None
 
+    def _depth_check(self, symbol: str) -> Optional[str]:
+        """Spread guard from the live order book (step 5).
+
+        Returns a rejection reason, or None when the trade may proceed.
+        Fail-OPEN: when the depth fetch itself fails, returns nothing,
+        or the router has no depth function, the trade proceeds — a
+        data blip must not halt trading. Only a measured spread wider
+        than the config threshold blocks.
+        """
+        if self.depth_fn is None:
+            return None
+        try:
+            depth = self.depth_fn(symbol)
+        except Exception as exc:
+            logger.warning("Depth check failed for %s (%s); proceeding", symbol, exc)
+            return None
+        if not depth:
+            logger.warning("No market depth for %s; proceeding", symbol)
+            return None
+        spread = depth.get("spread")
+        if spread is None or spread <= 0:
+            return None
+        if spread > self.config.max_option_spread_rs:
+            return (f"spread Rs {spread:.2f} > max "
+                    f"Rs {self.config.max_option_spread_rs:.2f}")
+        return None
+
     def _order_status(self, order_id: str) -> Optional[str]:
         """Best-effort fill check via the order book.
 
@@ -173,6 +206,14 @@ class ExecutionRouter:
                                "no valid option premium")
         mode = "PAPER" if (self.paper_mode or not self.fyers) else "LIVE"
         reason = self._risk_check(symbol, qty, ltp)
+        if reason:
+            logger.warning("Buy rejected for %s: %s", symbol, reason)
+            return OrderResult("", symbol, 0.0, qty, "REJECTED", mode, reason)
+        # Pre-trade depth check (step 5): the exact leg's live spread.
+        # Applies in paper mode too — the paper fill models a real
+        # entry, and a wide spread is a real entry cost. Exits are
+        # never depth-checked: a square-off must not be blocked.
+        reason = self._depth_check(symbol)
         if reason:
             logger.warning("Buy rejected for %s: %s", symbol, reason)
             return OrderResult("", symbol, 0.0, qty, "REJECTED", mode, reason)
