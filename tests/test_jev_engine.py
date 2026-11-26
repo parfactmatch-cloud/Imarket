@@ -507,6 +507,116 @@ def test_historical_levels_failure_is_not_ok(monkeypatch):
     assert levels["pdc"] == 23900.0
 
 
+# ---------------------------------------------------------------- prev-day levels
+def _daily_candles(rows):
+    """Daily [ts, o, h, l, c, vol] candles from (date, o, h, l, c) rows."""
+    return [[int(datetime(d.year, d.month, d.day, 9, 15, tzinfo=IST).timestamp()),
+             o, h, l, c, 1_000_000] for (d, o, h, l, c) in rows]
+
+
+def _history_ending(end_date, last_rows, skip=(), count=45):
+    """``count`` daily candles ending on ``end_date`` (skipping ``skip``).
+
+    Filler days rise 10 pts a day; the final rows are replaced by
+    ``last_rows`` (real values for the incident dates).
+    """
+    dates = []
+    d = end_date
+    while len(dates) < count:
+        if d not in skip:
+            dates.append(d)
+        d -= timedelta(days=1)
+    dates.reverse()
+    rows = []
+    for i, day in enumerate(dates):
+        close = 25000.0 + i * 10.0
+        rows.append((day, close - 50, close + 50, close - 80, close))
+    for (day, o, h, l, c) in last_rows:
+        for j, (dd, *_rest) in enumerate(rows):
+            if dd == day:
+                rows[j] = (day, o, h, l, c)
+    return _daily_candles(rows)
+
+
+class _HistoryFyers:
+    def __init__(self, candles):
+        self._candles = candles
+
+    def history(self, data):
+        return {"candles": list(self._candles)}
+
+
+def test_historical_levels_preopen_uses_last_completed_day(monkeypatch):
+    """26 Nov 2026 regression: at the 09:12 pre-open fetch Fyers' last
+    candle is Wed 25 Nov, not today -- the old candles[-2] code used
+    Mon 23 Nov's levels all day (PDC 25,349.65, not 25,819.25)."""
+    import main_jev_orchestrator as orch
+
+    monkeypatch.setattr(
+        orch, "get_ist_now", lambda: datetime(2026, 11, 26, 9, 12, tzinfo=IST))
+    candles = _history_ending(
+        date(2026, 11, 25),
+        [(date(2026, 11, 23), 25700.0, 25992.60, 25343.85, 25349.65),
+         (date(2026, 11, 25), 25658.35, 25951.65, 25619.00, 25819.25)],
+        skip={date(2026, 11, 24)})
+    levels, ok = orch.fetch_historical_levels(_HistoryFyers(candles))
+    assert ok is True
+    assert levels["pdc"] == 25819.25
+    assert levels["pdh"] == 25951.65
+    assert levels["pdl"] == 25619.00
+    # Week window must end on Wed 25 Nov too, not Mon 23 Nov.
+    expected_poc = orch._profile_from_candles(candles[-5:])["poc"]
+    assert levels["week_poc"] == expected_poc
+
+
+def test_historical_levels_skips_todays_partial_bar(monkeypatch):
+    """Mid-session the last candle is today's partial bar -- it must be
+    skipped, not taken as the previous day."""
+    import main_jev_orchestrator as orch
+
+    monkeypatch.setattr(
+        orch, "get_ist_now", lambda: datetime(2026, 11, 26, 10, 0, tzinfo=IST))
+    candles = _history_ending(
+        date(2026, 11, 25),
+        [(date(2026, 11, 25), 25658.35, 25951.65, 25619.00, 25819.25)],
+        skip={date(2026, 11, 24)})
+    candles.append(_daily_candles(
+        [(date(2026, 11, 26), 25850.0, 25900.0, 25840.0, 25880.0)])[0])
+    levels, ok = orch.fetch_historical_levels(_HistoryFyers(candles))
+    assert ok is True
+    assert levels["pdc"] == 25819.25
+    assert levels["pdh"] == 25951.65
+    assert levels["pdl"] == 25619.00
+
+
+def test_historical_levels_monday_uses_friday(monkeypatch):
+    """After a weekend the last completed day is Friday, not Thursday."""
+    import main_jev_orchestrator as orch
+
+    monkeypatch.setattr(
+        orch, "get_ist_now", lambda: datetime(2026, 11, 23, 9, 12, tzinfo=IST))
+    candles = _history_ending(
+        date(2026, 11, 20),
+        [(date(2026, 11, 20), 25500.0, 25808.80, 25345.20, 25800.60)])
+    levels, ok = orch.fetch_historical_levels(_HistoryFyers(candles))
+    assert ok is True
+    assert levels["pdc"] == 25800.60
+    assert levels["pdh"] == 25808.80
+    assert levels["pdl"] == 25345.20
+
+
+def test_historical_levels_only_today_bar_is_not_ok(monkeypatch):
+    """No completed day at all -- levels are unusable, not defaults."""
+    import main_jev_orchestrator as orch
+
+    monkeypatch.setattr(
+        orch, "get_ist_now", lambda: datetime(2026, 11, 26, 9, 12, tzinfo=IST))
+    candles = _daily_candles(
+        [(date(2026, 11, 26), 25850.0, 25900.0, 25840.0, 25880.0)])
+    levels, ok = orch.fetch_historical_levels(_HistoryFyers(candles))
+    assert ok is False
+
+
 def test_signal_alert_shows_sl_t1_t2():
     import main_jev_orchestrator as orch
 

@@ -166,19 +166,35 @@ def fetch_historical_levels(fyers_client):
         }
         response = fyers_client.history(data=data)
         candles = response.get("candles", [])
-        if len(candles) < 2:
+        # Fyers' daily history returns completed bars only until
+        # today's bar exists (there is none before the 09:15 open, and
+        # it may not appear mid-session either). The last candle is
+        # "today" only when its date is today; otherwise it IS the last
+        # completed day, and taking candles[-2] would silently use the
+        # day before that -- 26 Nov 2026 ran all day on Mon 23 Nov's
+        # levels this way (PDC 25,349.65 instead of 25,819.25).
+        completed = candles
+        if completed:
+            try:
+                last_date = datetime.fromtimestamp(
+                    completed[-1][0], tz=IST).date()
+            except (TypeError, ValueError, OverflowError, OSError):
+                last_date = None
+            if last_date == today.date():
+                completed = completed[:-1]
+        if len(completed) < 1:
             logger.error("Historical fetch returned only %d candles; levels unusable", len(candles))
             return levels, False
 
-        prev_candle = candles[-2]
+        prev_candle = completed[-1]
         levels["pdh"] = float(prev_candle[2])
         levels["pdl"] = float(prev_candle[3])
         levels["pdc"] = float(prev_candle[4])
 
-        recent_week = candles[-6:-1] if len(candles) >= 6 else candles[:-1]
-        prev_week = candles[-11:-6] if len(candles) >= 11 else recent_week
-        recent_month = candles[-21:-1] if len(candles) >= 21 else candles[:-1]
-        prev_month = candles[-42:-21] if len(candles) >= 42 else recent_month
+        recent_week = completed[-5:] if len(completed) >= 5 else completed
+        prev_week = completed[-10:-5] if len(completed) >= 10 else recent_week
+        recent_month = completed[-20:] if len(completed) >= 20 else completed
+        prev_month = completed[-41:-20] if len(completed) >= 41 else recent_month
 
         week = _profile_from_candles(recent_week)
         pweek = _profile_from_candles(prev_week)

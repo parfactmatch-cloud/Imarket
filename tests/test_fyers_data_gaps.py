@@ -191,7 +191,8 @@ class TestChainArchive(unittest.TestCase):
             path = archive_chain_snapshot(
                 self._chain(), spot=25455.90, expiry=date(2026, 12, 1),
                 snapshot=snap, vix=17.31, archive_dir=tmp)
-            assert path is not None and path.endswith("chain_2026-11-25.jsonl")
+            assert path is not None and path.endswith(
+                f"chain_{datetime.now(IST).date().isoformat()}.jsonl")
             with open(path, encoding="utf-8") as fh:
                 record = json.loads(fh.readline())
             assert record["spot"] == 25455.9
@@ -225,7 +226,8 @@ class TestChainArchive(unittest.TestCase):
                 snap = compute_gex_snapshot(
                     FlatChain(), 25455.90, date(2026, 12, 1), archive=True)
                 assert snap is not None
-                assert os.listdir(tmp) == ["chain_2026-11-25.jsonl"]
+                assert os.listdir(tmp) == [
+                    f"chain_{datetime.now(IST).date().isoformat()}.jsonl"]
             with tempfile.TemporaryDirectory() as tmp2:
                 with mock.patch.dict(os.environ, {"CHAIN_ARCHIVE_DIR": tmp2}):
                     compute_gex_snapshot(
